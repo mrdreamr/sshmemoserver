@@ -30,7 +30,7 @@ SSH Memo stores all data as plain Markdown files on an SSH server you own. This 
 
 ## Installation
 
-Clone the repository onto the server that hosts your SSH Memo files:
+Clone the repository anywhere on the server — it does **not** need to be inside your SSH Memo data folder:
 
 ```bash
 git clone https://github.com/mrdreamr/sshmemoserver
@@ -38,10 +38,11 @@ cd sshmemoserver
 bash install.sh
 ```
 
-The installer will:
-1. Create a Python virtualenv in the project directory
+The installer will ask for the path to your SSHMemo sync folder (the directory the app writes its Markdown files into), then:
+
+1. Create a Python virtualenv in the repository directory
 2. Install dependencies (`flask`, `cryptography`, `markdown`)
-3. Register and start a `sshmemo` systemd service running as the current user
+3. Register and start a `sshmemo` systemd service running as the current user, pointed at the data directory you specified
 
 Re-running `install.sh` is safe — it updates an existing installation.
 
@@ -61,12 +62,12 @@ The password doubles as the passphrase for decrypting private/encrypted notes.
 
 If no `.sshmemo_web.meta` is present or no users are configured in it, the server will not accept any logins.
 
-### Port and host
+### Port, host, and data directory
 
-By default the server listens on `localhost:8080`. To change this, edit the systemd service file at `/etc/systemd/system/sshmemo.service` and update the `ExecStart` line:
+The service file at `/etc/systemd/system/sshmemo.service` contains the full startup command. Edit the `ExecStart` line to change any of these:
 
 ```ini
-ExecStart=/path/to/venv/bin/sshmemo --host 0.0.0.0 --port 9000
+ExecStart=/path/to/venv/bin/sshmemo --root /path/to/data --host 0.0.0.0 --port 9000
 ```
 
 Then reload:
@@ -75,7 +76,7 @@ sudo systemctl daemon-reload
 sudo systemctl restart sshmemo
 ```
 
-> **Note:** If you expose the server to the internet, put it behind a reverse proxy (nginx, 
+> **Note:** If you expose the server to the internet, put it behind a reverse proxy (nginx,
 > Caddy) with HTTPS. The server itself does not handle TLS.
 
 ---

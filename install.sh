@@ -12,7 +12,24 @@ SERVICE_NAME="sshmemo"
 SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
 CURRENT_USER="$(whoami)"
 
+# ── Ask for the SSHMemo data directory ──────────────────────────────────────
+echo ""
+echo "Where is the SSHMemo sync folder (the directory your SSH server serves)?"
+echo "This is the folder that contains the per-user subdirectories written by the app (default is
+ ~/SSHMemo"
+read -rp "Data directory path: " DATA_DIR_INPUT
+DATA_DIR="$(eval echo "$DATA_DIR_INPUT")"   # expand ~ if used
+
+if [ ! -d "$DATA_DIR" ]; then
+    echo "ERROR: '$DATA_DIR' does not exist or is not a directory."
+    exit 1
+fi
+
+DATA_DIR="$(cd "$DATA_DIR" && pwd)"  # canonicalise
+
+echo ""
 echo "==> Install dir : $INSTALL_DIR"
+echo "==> Data dir    : $DATA_DIR"
 echo "==> Venv        : $VENV_DIR"
 echo "==> Service user: $CURRENT_USER"
 
@@ -39,7 +56,7 @@ After=network.target
 [Service]
 User=$CURRENT_USER
 WorkingDirectory=$INSTALL_DIR
-ExecStart=$VENV_DIR/bin/sshmemo
+ExecStart=$VENV_DIR/bin/sshmemo --root $DATA_DIR
 Restart=always
 Environment=FLASK_ENV=production
 
@@ -60,8 +77,8 @@ else
     echo "==> Service started."
 fi
 
-# add empty meta file
-touch "$INSTALL_DIR/.sshmemo_web.meta"
+# add empty meta file in the data directory (if it doesn't already exist)
+touch "$DATA_DIR/.sshmemo_web.meta"
 
 echo ""
 echo "Done. Check status with:  sudo systemctl status $SERVICE_NAME"
