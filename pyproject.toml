@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=42", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sshmemo-server"
+version = "0.1.0"
+description = "Browser-based UI for SSHMemo markdown files"
+requires-python = ">=3.7"
+license = { text = "MIT" }
+dependencies = [
+    "flask>=2.0",
+    "cryptography>=3.4",
+    "markdown>=3.3",
+]
+
+[project.scripts]
+sshmemo = "sshmemo:main"
+
+[tool.setuptools]
+py-modules = ["sshmemo"]
