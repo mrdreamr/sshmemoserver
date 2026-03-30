@@ -1035,6 +1035,33 @@ _EDIT = _BASE + """
   <input type="hidden" name="type" value="{{ type }}">
   <button type="submit" class="btn btn-danger btn-sm" style="margin-top:10px">🗑 Mark deleted</button>
 </form>
+<div class="attach-section" style="margin-top:24px">
+  <div class="attach-label">Attachments</div>
+  {% if item.attachments %}
+  {% for a in item.attachments %}
+  <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px">
+    <span>{% if a.mime_type.startswith('image/') %}🖼{% elif a.mime_type.startswith('audio/') %}🎵{% elif a.mime_type.startswith('video/') %}🎬{% else %}📎{% endif %}</span>
+    <a href="{{ url_for('serve_attachment', rel=rel, name=a.remote_name) }}" target="_blank" style="font-size:13px;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{{ a.remote_name }}</a>
+    <form class="il" method="post" action="{{ url_for('delete_attachment') }}"
+          onsubmit="return confirm('Delete {{ a.remote_name }}?')">
+      <input type="hidden" name="rel" value="{{ rel }}">
+      <input type="hidden" name="att_id" value="{{ a.id }}">
+      <input type="hidden" name="type" value="{{ type }}">
+      <button class="btn btn-danger btn-sm">🗑</button>
+    </form>
+  </div>
+  {% endfor %}
+  {% else %}
+  <p class="empty">No attachments.</p>
+  {% endif %}
+  <form method="post" action="{{ url_for('upload_attachment') }}" enctype="multipart/form-data"
+        style="margin-top:12px;display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+    <input type="hidden" name="rel" value="{{ rel }}">
+    <input type="hidden" name="type" value="{{ type }}">
+    <input type="file" name="file" style="width:auto;flex:1" required>
+    <button type="submit" class="btn btn-primary btn-sm">⬆ Upload</button>
+  </form>
+</div>
 {% endif %}
 </main>"""
 
@@ -1256,6 +1283,76 @@ def create_app(root: Path) -> Flask:
             abort(404)
         mime, _ = mimetypes.guess_type(name)
         return Response(attach_path.read_bytes(), mimetype=mime or 'application/octet-stream')
+
+    def _attach_dir(md_path: Path) -> Path:
+        stem = md_path.name[:-3] if md_path.name.endswith('.md') else md_path.name
+        stem = stem.lstrip('.')
+        return md_path.parent / stem
+
+    @app.route('/attachment/upload', methods=['POST'])
+    @require_login
+    def upload_attachment():
+        import mimetypes
+        from werkzeug.utils import secure_filename
+        store = get_store()
+        rel = request.form.get('rel', '')
+        itype = request.form.get('type', 'note')
+        path = store.safe_abs(rel)
+        text = store.read_text(path)
+        if text is None:
+            abort(404)
+        f = request.files.get('file')
+        if not f or not f.filename:
+            return redirect(url_for('edit', rel=rel, type=itype, err='No file selected'))
+        filename = secure_filename(f.filename)
+        if not filename:
+            return redirect(url_for('edit', rel=rel, type=itype, err='Invalid filename'))
+        attach_dir = _attach_dir(path)
+        attach_dir.mkdir(parents=True, exist_ok=True)
+        attach_path = (attach_dir / filename).resolve()
+        if not str(attach_path).startswith(str(root.resolve())):
+            abort(403)
+        f.save(str(attach_path))
+        mime = f.content_type or mimetypes.guess_type(filename)[0] or 'application/octet-stream'
+        att = Attachment(id=secrets.token_hex(8), mime_type=mime, remote_name=filename)
+        item = parse_task(text) if itype == 'task' else parse_note(text)
+        if item is None:
+            abort(404)
+        item.attachments.append(att)
+        private = path.name.startswith('.')
+        md = task_to_markdown(item) if itype == 'task' else note_to_markdown(item)
+        store.write_text(path, md, private=private)
+        store.write_sidecar(path, int(time.time() * 1000), session.get('username'))
+        return redirect(url_for('edit', rel=rel, type=itype, ok=f'"{filename}" uploaded'))
+
+    @app.route('/attachment/delete', methods=['POST'])
+    @require_login
+    def delete_attachment():
+        store = get_store()
+        rel = request.form.get('rel', '')
+        itype = request.form.get('type', 'note')
+        att_id = request.form.get('att_id', '')
+        path = store.safe_abs(rel)
+        text = store.read_text(path)
+        if text is None:
+            abort(404)
+        item = parse_task(text) if itype == 'task' else parse_note(text)
+        if item is None:
+            abort(404)
+        att = next((a for a in item.attachments if a.id == att_id), None)
+        if att is None:
+            return redirect(url_for('edit', rel=rel, type=itype, err='Attachment not found'))
+        attach_path = (_attach_dir(path) / att.remote_name).resolve()
+        if not str(attach_path).startswith(str(root.resolve())):
+            abort(403)
+        if attach_path.is_file():
+            attach_path.unlink()
+        item.attachments.remove(att)
+        private = path.name.startswith('.')
+        md = task_to_markdown(item) if itype == 'task' else note_to_markdown(item)
+        store.write_text(path, md, private=private)
+        store.write_sidecar(path, int(time.time() * 1000), session.get('username'))
+        return redirect(url_for('edit', rel=rel, type=itype, ok=f'"{att.remote_name}" deleted'))
 
     @app.route('/new/task', methods=['GET', 'POST'])
     @require_login
