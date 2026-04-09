@@ -154,6 +154,7 @@ class Attachment:
     id: str
     mime_type: str
     remote_name: str
+    updated_at: int = 0  # ms timestamp; synced via .attachments.meta
 
 
 @dataclass
@@ -235,9 +236,10 @@ def _parse_meta_lines(lines: list[str], start: int) -> tuple[dict, int]:
             except ValueError:
                 pass
         elif lo.startswith("attachment:"):
-            parts = val(11).split("|", 2)
-            if len(parts) == 3:
-                attachments.append(Attachment(id=parts[0], mime_type=parts[1], remote_name=parts[2]))
+            parts = val(11).split("|", 3)
+            if len(parts) >= 3:
+                updated_at = int(parts[3]) if len(parts) >= 4 and parts[3].strip().isdigit() else 0
+                attachments.append(Attachment(id=parts[0], mime_type=parts[1], remote_name=parts[2], updated_at=updated_at))
         else:
             break
         i += 1
@@ -305,7 +307,7 @@ def task_to_markdown(task: Task) -> str:
     if task.category:
         lines.append(f"Category: {task.category}")
     for a in task.attachments:
-        lines.append(f"Attachment: {a.id}|{a.mime_type}|{a.remote_name}")
+        lines.append(f"Attachment: {a.id}|{a.mime_type}|{a.remote_name}|{a.updated_at}")
     lines.append("")
     lines.append(task.description.strip())
     return "\n".join(lines)
@@ -322,7 +324,7 @@ def note_to_markdown(note: Note) -> str:
     if note.remind_at:
         lines.append(f"Remind: {format_reminder_stamp(note.remind_at)}")
     for a in note.attachments:
-        lines.append(f"Attachment: {a.id}|{a.mime_type}|{a.remote_name}")
+        lines.append(f"Attachment: {a.id}|{a.mime_type}|{a.remote_name}|{a.updated_at}")
     if note.category:
         lines.append(f"Category: {note.category}")
     lines.append("")
@@ -952,27 +954,45 @@ _VIEW = _BASE + """
     {% if item.edited_at %}<span>{{ item.edited_at | eddate }}</span>{% endif %}
   </div>
   <div class="content">{{ content_html | safe }}</div>
-  {% if item.attachments %}
   <div class="attach-section">
     <div class="attach-label">Attachments</div>
+    {% if item.attachments %}
     {% for a in item.attachments %}
     <div class="attach-item">
       {% if a.mime_type.startswith('image/') %}
       <img class="attach-img" src="{{ url_for('serve_attachment', rel=rel, name=a.remote_name) }}" alt="{{ a.remote_name }}">
-      <div class="attach-name">{{ a.remote_name }}</div>
       {% elif a.mime_type.startswith('audio/') %}
       <audio controls src="{{ url_for('serve_attachment', rel=rel, name=a.remote_name) }}"></audio>
-      <div class="attach-name">{{ a.remote_name }}</div>
       {% elif a.mime_type.startswith('video/') %}
       <video controls style="max-width:100%;border-radius:6px" src="{{ url_for('serve_attachment', rel=rel, name=a.remote_name) }}"></video>
-      <div class="attach-name">{{ a.remote_name }}</div>
       {% else %}
-      <a class="btn" href="{{ url_for('serve_attachment', rel=rel, name=a.remote_name) }}" download="{{ a.remote_name }}">⬇ {{ a.remote_name }}</a>
+      <a class="btn btn-sm" href="{{ url_for('serve_attachment', rel=rel, name=a.remote_name) }}" download="{{ a.remote_name }}">⬇ {{ a.remote_name }}</a>
       {% endif %}
+      <div style="display:flex;align-items:center;gap:8px;margin-top:4px">
+        <span class="attach-name" style="flex:1">{{ a.remote_name }}</span>
+        <form class="il" method="post" action="{{ url_for('delete_attachment') }}"
+              onsubmit="return confirm('Delete {{ a.remote_name }}?')">
+          <input type="hidden" name="rel" value="{{ rel }}">
+          <input type="hidden" name="att_id" value="{{ a.id }}">
+          <input type="hidden" name="type" value="{{ type }}">
+          <input type="hidden" name="next" value="{{ url_for('view', rel=rel, type=type) }}">
+          <button class="btn btn-danger btn-sm">🗑</button>
+        </form>
+      </div>
     </div>
     {% endfor %}
+    {% else %}
+    <p class="empty">No attachments.</p>
+    {% endif %}
+    <form method="post" action="{{ url_for('upload_attachment') }}" enctype="multipart/form-data"
+          style="margin-top:12px;display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+      <input type="hidden" name="rel" value="{{ rel }}">
+      <input type="hidden" name="type" value="{{ type }}">
+      <input type="hidden" name="next" value="{{ url_for('view', rel=rel, type=type) }}">
+      <input type="file" name="file" style="width:auto;flex:1" required>
+      <button type="submit" class="btn btn-primary btn-sm">⬆ Upload</button>
+    </form>
   </div>
-  {% endif %}
 </div>
 </main>"""
 
@@ -1133,6 +1153,22 @@ _HISTORY = _BASE + """
 </main>"""
 
 
+# ── URL helpers ─────────────────────────────────────────────────────────────
+
+def _flash_redirect(next_url: Optional[str], fallback: str,
+                    ok: Optional[str] = None, err: Optional[str] = None) -> str:
+    """Append ok=/err= query param to next_url (or fallback) and return the result."""
+    from urllib.parse import urlparse, urlencode, parse_qs, urlunparse
+    base = next_url or fallback
+    parsed = urlparse(base)
+    params: dict = {k: v[0] for k, v in parse_qs(parsed.query, keep_blank_values=True).items()}
+    if ok is not None:
+        params['ok'] = ok
+    if err is not None:
+        params['err'] = err
+    return urlunparse(parsed._replace(query=urlencode(params)))
+
+
 # ── Flask app factory ───────────────────────────────────────────────────────
 
 def create_app(root: Path) -> Flask:
@@ -1289,6 +1325,30 @@ def create_app(root: Path) -> Flask:
         stem = stem.lstrip('.')
         return md_path.parent / stem
 
+    def _read_attach_meta(attach_dir: Path) -> dict:
+        """Read .attachments.meta → {remote_name: updated_at} dict."""
+        meta_path = attach_dir / '.attachments.meta'
+        if not meta_path.is_file():
+            return {}
+        result = {}
+        for line in meta_path.read_text(encoding='utf-8').splitlines():
+            if '|' in line:
+                name, _, ts = line.partition('|')
+                try:
+                    result[name.strip()] = int(ts.strip())
+                except ValueError:
+                    pass
+        return result
+
+    def _write_attach_meta(attach_dir: Path, meta: dict) -> None:
+        """Write {remote_name: updated_at} dict to .attachments.meta atomically."""
+        attach_dir.mkdir(parents=True, exist_ok=True)
+        meta_path = attach_dir / '.attachments.meta'
+        tmp_path = attach_dir / '.attachments.meta.tmp'
+        content = ''.join(f'{name}|{ts}\n' for name, ts in meta.items())
+        tmp_path.write_text(content, encoding='utf-8')
+        tmp_path.replace(meta_path)
+
     @app.route('/attachment/upload', methods=['POST'])
     @require_login
     def upload_attachment():
@@ -1314,16 +1374,25 @@ def create_app(root: Path) -> Flask:
             abort(403)
         f.save(str(attach_path))
         mime = f.content_type or mimetypes.guess_type(filename)[0] or 'application/octet-stream'
-        att = Attachment(id=secrets.token_hex(8), mime_type=mime, remote_name=filename)
+        now_ms = int(time.time() * 1000)
+        att = Attachment(id=secrets.token_hex(8), mime_type=mime, remote_name=filename, updated_at=now_ms)
         item = parse_task(text) if itype == 'task' else parse_note(text)
         if item is None:
             abort(404)
+        # Replace any existing attachment with the same filename so timestamps stay consistent
+        item.attachments = [a for a in item.attachments if a.remote_name != filename]
         item.attachments.append(att)
         private = path.name.startswith('.')
         md = task_to_markdown(item) if itype == 'task' else note_to_markdown(item)
         store.write_text(path, md, private=private)
-        store.write_sidecar(path, int(time.time() * 1000), session.get('username'))
-        return redirect(url_for('edit', rel=rel, type=itype, ok=f'"{filename}" uploaded'))
+        store.write_sidecar(path, now_ms, session.get('username'))
+        # Update .attachments.meta so other devices detect the new/replaced file
+        meta = _read_attach_meta(attach_dir)
+        meta[filename] = now_ms
+        _write_attach_meta(attach_dir, meta)
+        return redirect(_flash_redirect(request.form.get('next'),
+                                        url_for('edit', rel=rel, type=itype),
+                                        ok=f'"{filename}" uploaded'))
 
     @app.route('/attachment/delete', methods=['POST'])
     @require_login
@@ -1341,8 +1410,11 @@ def create_app(root: Path) -> Flask:
             abort(404)
         att = next((a for a in item.attachments if a.id == att_id), None)
         if att is None:
-            return redirect(url_for('edit', rel=rel, type=itype, err='Attachment not found'))
-        attach_path = (_attach_dir(path) / att.remote_name).resolve()
+            return redirect(_flash_redirect(request.form.get('next'),
+                                            url_for('edit', rel=rel, type=itype),
+                                            err='Attachment not found'))
+        attach_dir = _attach_dir(path)
+        attach_path = (attach_dir / att.remote_name).resolve()
         if not str(attach_path).startswith(str(root.resolve())):
             abort(403)
         if attach_path.is_file():
@@ -1352,7 +1424,18 @@ def create_app(root: Path) -> Flask:
         md = task_to_markdown(item) if itype == 'task' else note_to_markdown(item)
         store.write_text(path, md, private=private)
         store.write_sidecar(path, int(time.time() * 1000), session.get('username'))
-        return redirect(url_for('edit', rel=rel, type=itype, ok=f'"{att.remote_name}" deleted'))
+        # Remove the entry from .attachments.meta so other devices delete the file on next sync
+        meta = _read_attach_meta(attach_dir)
+        meta.pop(att.remote_name, None)
+        if meta:
+            _write_attach_meta(attach_dir, meta)
+        else:
+            meta_path = attach_dir / '.attachments.meta'
+            if meta_path.is_file():
+                meta_path.unlink()
+        return redirect(_flash_redirect(request.form.get('next'),
+                                        url_for('edit', rel=rel, type=itype),
+                                        ok=f'"{att.remote_name}" deleted'))
 
     @app.route('/new/task', methods=['GET', 'POST'])
     @require_login
