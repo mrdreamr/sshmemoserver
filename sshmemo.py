@@ -60,6 +60,13 @@ try:
 except ImportError:
     raise SystemExit("markdown is required: pip install markdown")
 
+try:
+    import nh3 as _nh3
+    _NH3_AVAILABLE = True
+except ImportError:
+    _nh3 = None  # type: ignore
+    _NH3_AVAILABLE = False
+
 
 # ── Crypto (mirrors ItemCryptoAndroid exactly) ─────────────────────────────
 # Wire format: [16-byte salt][12-byte IV][ciphertext + 16-byte GCM tag]
@@ -782,11 +789,13 @@ _NAV = """<nav>
   <a href="{{ url_for('new_task') }}">+ Task</a>
   <a href="{{ url_for('new_note') }}">+ Note</a>
   <a href="{{ url_for('history') }}">History</a>
+  <a href="{{ url_for('search') }}">🔍 Search</a>
   <span class="sp"></span>
   <span class="root-label">{{ root_label }}</span>
   {% if current_user %}
   <span style="font-size:13px;color:var(--mut)">👤 {{ current_user }}</span>
   <form class="il" method="post" action="{{ url_for('logout') }}">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
     <button class="btn btn-sm" style="font-size:12px">Log out</button>
   </form>
   {% endif %}
@@ -808,6 +817,7 @@ _LOGIN = _STYLE + """
   {{ flash | safe }}
   <div style="background:var(--sur);border:1px solid var(--bdr);border-radius:var(--rad);padding:24px;box-shadow:var(--sha)">
     <form method="post" action="{{ url_for('login') }}">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
       <div class="fr"><label>Username</label>
         <input type="text" name="username" autocomplete="username" autofocus required>
       </div>
@@ -842,6 +852,7 @@ _INDEX = _BASE + """
   </div>
   <div class="card-actions">
     <form class="il" method="post" action="{{ url_for('toggle') }}">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
       <input type="hidden" name="rel" value="{{ rrel(task.path) }}">
       <button class="btn btn-sm">{{ '☑' if task.done else '☐' }}</button>
     </form>
@@ -885,6 +896,7 @@ _INDEX = _BASE + """
   </div>
   <div class="card-actions">
     <form class="il" method="post" action="{{ url_for('toggle') }}">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
       <input type="hidden" name="rel" value="{{ rrel(task.path) }}">
       <button class="btn btn-sm">{{ '☑' if task.done else '☐' }}</button>
     </form>
@@ -951,6 +963,7 @@ _VIEW = _BASE + """
   <div style="display:flex;gap:8px;margin-bottom:14px">
     {% if type == 'task' %}
     <form class="il" method="post" action="{{ url_for('toggle') }}">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
       <input type="hidden" name="rel" value="{{ rel }}">
       <input type="hidden" name="next" value="{{ url_for('view', rel=rel, type='task') }}">
       <button class="btn">{{ '☑ Mark undone' if item.done else '☐ Mark done' }}</button>
@@ -988,6 +1001,7 @@ _VIEW = _BASE + """
         <span class="attach-name" style="flex:1">{{ a.remote_name }}</span>
         <form class="il" method="post" action="{{ url_for('delete_attachment') }}"
               onsubmit="return confirm('Delete {{ a.remote_name }}?')">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
           <input type="hidden" name="rel" value="{{ rel }}">
           <input type="hidden" name="att_id" value="{{ a.id }}">
           <input type="hidden" name="type" value="{{ type }}">
@@ -1002,6 +1016,7 @@ _VIEW = _BASE + """
     {% endif %}
     <form method="post" action="{{ url_for('upload_attachment') }}" enctype="multipart/form-data"
           style="margin-top:12px">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
       <input type="hidden" name="rel" value="{{ rel }}">
       <input type="hidden" name="type" value="{{ type }}">
       <input type="hidden" name="next" value="{{ url_for('view', rel=rel, type=type) }}">
@@ -1017,6 +1032,36 @@ _VIEW = _BASE + """
     </form>
   </div>
 </div>
+{% if highlight %}
+<style>mark{background:#ffe082;color:inherit;border-radius:3px;padding:0 2px}</style>
+<script>
+(function(){
+  var q = {{ highlight | tojson }};
+  if (!q) return;
+  var content = document.querySelector('.content');
+  if (!content) return;
+  var walker = document.createTreeWalker(content, NodeFilter.SHOW_TEXT);
+  var node, first = null;
+  var ql = q.toLowerCase();
+  while ((node = walker.nextNode())) {
+    var idx = node.nodeValue.toLowerCase().indexOf(ql);
+    if (idx < 0) continue;
+    var before = node.nodeValue.slice(0, idx);
+    var match  = node.nodeValue.slice(idx, idx + q.length);
+    var after  = node.nodeValue.slice(idx + q.length);
+    var mark = document.createElement('mark');
+    mark.textContent = match;
+    var frag = document.createDocumentFragment();
+    if (before) frag.appendChild(document.createTextNode(before));
+    frag.appendChild(mark);
+    if (after) frag.appendChild(document.createTextNode(after));
+    node.parentNode.replaceChild(frag, node);
+    if (!first) first = mark;
+  }
+  if (first) first.scrollIntoView({behavior:'smooth', block:'center'});
+})();
+</script>
+{% endif %}
 </main>"""
 
 _EDIT = _BASE + """
@@ -1024,6 +1069,7 @@ _EDIT = _BASE + """
 <h1>{{ 'Edit' if is_edit else 'New' }} {{ 'Task' if type == 'task' else 'Note' }}</h1>
 {{ flash | safe }}
 <form method="post">
+  <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
   <div class="fr"><label>Title</label>
     <input type="text" name="title" value="{{ item.title }}" required autofocus>
   </div>
@@ -1074,6 +1120,7 @@ _EDIT = _BASE + """
 {% if is_edit %}
 <form method="post" action="{{ url_for('delete') }}" style="display:inline;margin-top:10px"
       onsubmit="return confirm('Mark this item as deleted?')">
+  <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
   <input type="hidden" name="rel" value="{{ rel }}">
   <input type="hidden" name="type" value="{{ type }}">
   <button type="submit" class="btn btn-danger btn-sm" style="margin-top:10px">🗑 Mark deleted</button>
@@ -1087,6 +1134,7 @@ _EDIT = _BASE + """
     <a href="{{ url_for('serve_attachment', rel=rel, name=a.remote_name) }}" target="_blank" style="font-size:13px;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{{ a.remote_name }}</a>
     <form class="il" method="post" action="{{ url_for('delete_attachment') }}"
           onsubmit="return confirm('Delete {{ a.remote_name }}?')">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
       <input type="hidden" name="rel" value="{{ rel }}">
       <input type="hidden" name="att_id" value="{{ a.id }}">
       <input type="hidden" name="type" value="{{ type }}">
@@ -1099,6 +1147,7 @@ _EDIT = _BASE + """
   {% endif %}
   <form method="post" action="{{ url_for('upload_attachment') }}" enctype="multipart/form-data"
         style="margin-top:12px">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
     <input type="hidden" name="rel" value="{{ rel }}">
     <input type="hidden" name="type" value="{{ type }}">
     <div style="display:flex;gap:8px;align-items:center;margin-bottom:6px">
@@ -1150,6 +1199,7 @@ _HISTORY = _BASE + """
   <div class="card-actions">
     <form class="il" method="post" action="{{ url_for('restore') }}"
           onsubmit="return confirm('Restore? It will sync to all devices as a new item.')">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
       <input type="hidden" name="rel" value="{{ rrel(task.path) }}">
       <button class="btn btn-sm btn-primary">↩ Restore</button>
     </form>
@@ -1173,6 +1223,7 @@ _HISTORY = _BASE + """
   <div class="card-actions">
     <form class="il" method="post" action="{{ url_for('restore') }}"
           onsubmit="return confirm('Restore? It will sync to all devices as a new item.')">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
       <input type="hidden" name="rel" value="{{ rrel(note.path) }}">
       <button class="btn btn-sm btn-primary">↩ Restore</button>
     </form>
@@ -1180,6 +1231,37 @@ _HISTORY = _BASE + """
 </div>
 {% endfor %}
 {% endif %}
+</main>"""
+
+
+_SEARCH = _BASE + """
+<main>
+<h1>Search</h1>
+{{ flash | safe }}
+<form method="get" action="{{ url_for('search') }}" style="display:flex;gap:8px;margin-bottom:20px">
+  <input type="text" name="q" value="{{ q | e }}" placeholder="Search tasks and notes…"
+         autofocus style="flex:1;max-width:480px">
+  <button type="submit" class="btn btn-primary">Search</button>
+  {% if q %}<a class="btn" href="{{ url_for('search') }}">✕</a>{% endif %}
+</form>
+
+{% if q and not results %}
+<p class="empty">No results for <strong>{{ q | e }}</strong>.</p>
+{% endif %}
+
+{% for r in results %}
+<div class="card">
+  <div class="card-body">
+    <div class="card-title">
+      <span style="font-size:12px;color:var(--mut);margin-right:6px">{{ '☑' if r.is_task else '✎' }}</span>
+      <a href="{{ url_for('view', rel=r.rel, type=r.type, highlight=q) }}">{{ r.title }}</a>
+    </div>
+    {% if r.snippet %}
+    <div class="card-meta" style="font-size:12px;white-space:pre-wrap">{{ r.snippet | safe }}</div>
+    {% endif %}
+  </div>
+</div>
+{% endfor %}
 </main>"""
 
 
@@ -1210,6 +1292,45 @@ def create_app(root: Path) -> Flask:
     # url_for() and redirects include the subpath when proxied under a prefix.
     app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_prefix=1)
 
+    # ── CSRF protection ─────────────────────────────────────────────────────
+
+    def get_csrf_token() -> str:
+        if '_csrf' not in session:
+            session['_csrf'] = secrets.token_hex(32)
+        return session['_csrf']
+
+    def csrf_protect(f):
+        @functools.wraps(f)
+        def wrapped(*args, **kwargs):
+            if request.method == 'POST':
+                token = request.form.get('csrf_token', '')
+                stored = session.get('_csrf', '')
+                if not stored or not hmac.compare_digest(token, stored):
+                    abort(403)
+            return f(*args, **kwargs)
+        return wrapped
+
+    app.jinja_env.globals['csrf_token'] = get_csrf_token
+
+    # ── Markdown sanitisation allowlist ────────────────────────────────────
+    _MD_ALLOWED_TAGS = {
+        'p', 'br', 'hr', 'strong', 'em', 'del', 'b', 'i', 'u',
+        'h1', 'h2', 'h3', 'h4', 'h5', 'h6',
+        'ul', 'ol', 'li',
+        'blockquote', 'pre', 'code',
+        'table', 'thead', 'tbody', 'tfoot', 'tr', 'th', 'td',
+        'a', 'img',
+        'div', 'span',
+        'input',  # for GFM task-list checkboxes
+    }
+    _MD_ALLOWED_ATTRS = {
+        'a': {'href', 'title', 'target'},
+        'img': {'src', 'alt', 'title', 'width', 'height'},
+        'input': {'type', 'checked', 'disabled'},
+        'th': {'align'}, 'td': {'align'},
+        'div': {'class'}, 'span': {'class'}, 'code': {'class'},
+    }
+
     def get_store() -> FileStore:
         username = session.get('username', '')
         passphrase = load_web_users(root).get(username)
@@ -1224,7 +1345,10 @@ def create_app(root: Path) -> Flask:
         return wrapped
 
     def render_md(text: str) -> str:
-        return md_lib.markdown(text, extensions=['extra', 'nl2br'])
+        raw = md_lib.markdown(text, extensions=['extra', 'nl2br'])
+        if _NH3_AVAILABLE:
+            return _nh3.clean(raw, tags=_MD_ALLOWED_TAGS, attributes=_MD_ALLOWED_ATTRS)
+        return raw
 
     def rewrite_attach_urls(body: str, rel: str) -> str:
         """Rewrite relative attachment links (slug/filename) embedded in markdown to the /attachment route."""
@@ -1273,9 +1397,15 @@ def create_app(root: Path) -> Flask:
         from urllib.parse import quote
         return quote(str(v), safe='')
 
+    @app.template_filter('tojson')
+    def f_tojson(v):
+        import json
+        return json.dumps(str(v) if v is not None else '')
+
     # ── Auth routes ────────────────────────────────────────────────────────
 
     @app.route('/login', methods=['GET', 'POST'])
+    @csrf_protect
     def login():
         users = load_web_users(root)
         if request.method == 'POST':
@@ -1293,6 +1423,7 @@ def create_app(root: Path) -> Flask:
                                       no_users=not users, flash='')
 
     @app.route('/logout', methods=['POST'])
+    @csrf_protect
     def logout():
         session.clear()
         return redirect(url_for('login'))
@@ -1312,6 +1443,7 @@ def create_app(root: Path) -> Flask:
         store = get_store()
         rel = request.args.get('rel', '')
         itype = request.args.get('type', 'note')
+        highlight = request.args.get('highlight', '').strip()
         path = store.safe_abs(rel)
         text = store.read_text(path)
         if text is None:
@@ -1323,6 +1455,51 @@ def create_app(root: Path) -> Flask:
         body = rewrite_attach_urls(body, rel)
         return render_template_string(_VIEW, item=item, type=itype,
                                       rel=rel, content_html=render_md(body),
+                                      highlight=highlight,
+                                      flash=flash_msg(), **ctx())
+
+    @app.route('/search')
+    @require_login
+    def search():
+        from markupsafe import escape
+        store = get_store()
+        q = request.args.get('q', '').strip()
+        results = []
+        if len(q) >= 2:
+            data = store.load_for_user(session['username'])
+            all_items = (
+                [(t, True) for t in data['shared_tasks'] + data.get('user_tasks', []) if not t.deleted_at]
+                + [(n, False) for n in data['shared_notes'] + data.get('user_notes', []) if not n.deleted_at]
+                + [(n, False) for notes in data.get('category_notes', {}).values()
+                   for n in notes if not n.deleted_at]
+            )
+            ql = q.lower()
+            for item, is_task in all_items:
+                body = item.description if is_task else item.content
+                in_title = ql in item.title.lower()
+                in_body = ql in body.lower()
+                if not in_title and not in_body:
+                    continue
+                source = body if in_body else item.title
+                idx = source.lower().find(ql)
+                ctx_len = 60
+                start = max(0, idx - ctx_len)
+                end = min(len(source), idx + len(q) + ctx_len)
+                raw = source[start:end]
+                prefix = '…' if start > 0 else ''
+                suffix = '…' if end < len(source) else ''
+                before = escape(prefix + raw[:idx - start])
+                matched = f'<mark style="background:#ffe082;border-radius:3px;padding:0 2px">{escape(raw[idx - start:idx - start + len(q)])}</mark>'
+                after = escape(raw[idx - start + len(q):] + suffix)
+                snippet = str(before) + matched + str(after)
+                results.append({
+                    'title': item.title,
+                    'rel': store.rel(item.path) if item.path else '',
+                    'type': 'task' if is_task else 'note',
+                    'is_task': is_task,
+                    'snippet': snippet,
+                })
+        return render_template_string(_SEARCH, q=q, results=results,
                                       flash=flash_msg(), **ctx())
 
     @app.route('/attachment')
@@ -1381,6 +1558,7 @@ def create_app(root: Path) -> Flask:
 
     @app.route('/attachment/upload', methods=['POST'])
     @require_login
+    @csrf_protect
     def upload_attachment():
         import mimetypes
         from werkzeug.utils import secure_filename
@@ -1430,6 +1608,7 @@ def create_app(root: Path) -> Flask:
 
     @app.route('/attachment/delete', methods=['POST'])
     @require_login
+    @csrf_protect
     def delete_attachment():
         store = get_store()
         rel = request.form.get('rel', '')
@@ -1473,6 +1652,7 @@ def create_app(root: Path) -> Flask:
 
     @app.route('/new/task', methods=['GET', 'POST'])
     @require_login
+    @csrf_protect
     def new_task():
         store = get_store()
         username = session['username']
@@ -1500,6 +1680,7 @@ def create_app(root: Path) -> Flask:
 
     @app.route('/new/note', methods=['GET', 'POST'])
     @require_login
+    @csrf_protect
     def new_note():
         store = get_store()
         username = session['username']
@@ -1530,6 +1711,7 @@ def create_app(root: Path) -> Flask:
 
     @app.route('/edit', methods=['GET', 'POST'])
     @require_login
+    @csrf_protect
     def edit():
         store = get_store()
         username = session['username']
@@ -1598,6 +1780,7 @@ def create_app(root: Path) -> Flask:
 
     @app.route('/toggle', methods=['POST'])
     @require_login
+    @csrf_protect
     def toggle():
         store = get_store()
         rel = request.form.get('rel', '')
@@ -1616,6 +1799,7 @@ def create_app(root: Path) -> Flask:
 
     @app.route('/delete', methods=['POST'])
     @require_login
+    @csrf_protect
     def delete():
         store = get_store()
         rel = request.form.get('rel', '')
@@ -1632,6 +1816,7 @@ def create_app(root: Path) -> Flask:
 
     @app.route('/restore', methods=['POST'])
     @require_login
+    @csrf_protect
     def restore():
         store = get_store()
         rel = request.form.get('rel', '')

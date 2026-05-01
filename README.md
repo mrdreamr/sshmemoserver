@@ -1,7 +1,6 @@
 # SSHMemo Server
 
-A lightweight web UI companion for the SSH Memo Android app (Currently in closed testing, update 
-will happen on release).
+A lightweight web UI companion for the SSH Memo Android app [SSH Memo](https://play.google.com/store/apps/details?id=fi.dreamr.sshtodo)
 
 It reads and writes the same Markdown files used by the app, letting you view, create, and edit your tasks and notes from any browser — on your own server, under your own control.
 

@@ -12,6 +12,7 @@ dependencies = [
     "flask>=2.0",
     "cryptography>=3.4",
     "markdown>=3.3",
+    "nh3>=0.2",
 ]
 
 [project.scripts]
