@@ -720,6 +720,19 @@ nav .sp{flex:1}
 nav .root-label{font-size:12px;color:var(--mut);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:220px}
 main{max-width:880px;margin:24px auto;padding:0 16px}
 h1{font-size:20px;margin-bottom:16px;font-weight:700}
+.dashboard-shell{max-width:1180px;margin:24px auto;padding:0 16px;display:grid;grid-template-columns:190px minmax(0,1fr);gap:22px;align-items:start}
+.dashboard-content{min-width:0}
+.side-nav{background:var(--sur);border:1px solid var(--bdr);border-radius:var(--rad);box-shadow:var(--sha);padding:8px;position:sticky;top:68px}
+.side-nav a{display:block;color:var(--txt);padding:8px 10px;border-radius:6px;font-size:14px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.side-nav a:hover{background:var(--sur2);text-decoration:none}
+.side-nav a.active{background:var(--acc);color:#fff}
+.side-nav-title{font-size:11px;color:var(--mut);font-weight:700;text-transform:uppercase;letter-spacing:.5px;margin:10px 10px 4px}
+@media(max-width:760px){
+  .dashboard-shell{display:block;margin-top:16px}
+  .side-nav{position:static;margin-bottom:16px;display:flex;gap:6px;overflow-x:auto}
+  .side-nav a{flex:0 0 auto}
+  .side-nav-title{display:none}
+}
 .section{margin-top:24px;margin-bottom:4px;display:flex;align-items:center;gap:10px;flex-wrap:wrap}
 .section h2{font-size:15px;font-weight:600;color:var(--mut);flex-shrink:0}
 .card{background:var(--sur);border:1px solid var(--bdr);border-radius:var(--rad);
@@ -831,15 +844,33 @@ _LOGIN = _STYLE + """
 </main>"""
 
 _INDEX = _BASE + """
-<main>
+<main class="dashboard-shell">
+<aside class="side-nav" aria-label="Item type filter">
+  <a class="{{ 'active' if active_filter == 'all' }}" href="{{ url_for('index') }}">All items</a>
+  <a class="{{ 'active' if active_filter == 'tasks' }}" href="{{ url_for('index', filter='tasks') }}">Todo</a>
+  <a class="{{ 'active' if active_filter == 'notes' }}" href="{{ url_for('index', filter='notes') }}">Notes</a>
+  {% if nav_categories %}<div class="side-nav-title">Custom</div>{% endif %}
+  {% for cat in nav_categories %}
+    <a class="{{ 'active' if active_filter == 'cat:' ~ cat.name }}" href="{{ url_for('index', filter='cat:' ~ cat.name) }}">
+      {{ cat.icon or '📁' }} {{ cat.name }}
+    </a>
+  {% endfor %}
+</aside>
+<section class="dashboard-content">
 <h1>Dashboard</h1>
 {{ flash | safe }}
+
+{% set show_all = active_filter == 'all' %}
+{% set show_tasks = active_filter == 'tasks' %}
+{% set show_notes = active_filter == 'notes' %}
+{% set category_filter = active_filter[4:] if active_filter.startswith('cat:') else '' %}
 
 {# ── Shared ── #}
 {% set st = data.shared_tasks | selectattr('deleted_at', 'none') | list %}
 {% set sn = data.shared_notes | selectattr('deleted_at', 'none') | list %}
-{% if st or sn %}
+{% if (show_all and (st or sn)) or (show_tasks and st) or (show_notes and sn) %}
 <div class="section"><h2>🌐 Shared</h2></div>
+{% if show_all or show_tasks %}
 {% for task in st %}
 <div class="card {{ 'done' if task.done }}">
   <div class="card-body">
@@ -860,6 +891,8 @@ _INDEX = _BASE + """
   </div>
 </div>
 {% endfor %}
+{% endif %}
+{% if show_all or show_notes %}
 {% for note in sn %}
 <div class="card">
   <div class="card-body">
@@ -876,10 +909,12 @@ _INDEX = _BASE + """
 </div>
 {% endfor %}
 {% endif %}
+{% endif %}
 
 {# ── My Tasks ── #}
 {% set utasks = data.user_tasks | selectattr('deleted_at', 'none') | list %}
 {% set unotes = data.user_notes | selectattr('deleted_at', 'none') | list %}
+{% if show_all or show_tasks %}
 <div class="section">
   <h2>☑ My Tasks</h2>
   <a class="btn btn-sm btn-primary" href="{{ url_for('new_task') }}">+ Task</a>
@@ -905,8 +940,10 @@ _INDEX = _BASE + """
 </div>
 {% endfor %}
 {% if not utasks %}<p class="empty">No tasks yet.</p>{% endif %}
+{% endif %}
 
 {# ── My Notes ── #}
+{% if show_all or show_notes %}
 <div class="section">
   <h2>✎ My Notes</h2>
   <a class="btn btn-sm" href="{{ url_for('new_note') }}">+ Note</a>
@@ -927,19 +964,21 @@ _INDEX = _BASE + """
 </div>
 {% endfor %}
 {% if not unotes %}<p class="empty">No notes yet.</p>{% endif %}
+{% endif %}
 
 {# ── Categories ── #}
-{% for cat_name, cnotes in data.category_notes.items() %}
+{% for cat in nav_categories %}
+{% set cat_name = cat.name %}
+{% set cnotes = data.category_notes.get(cat_name, []) %}
 {% set active = cnotes | selectattr('deleted_at', 'none') | list %}
-{% if active %}
-{% set cat = data.categories | selectattr('name', 'equalto', cat_name) | first | default(None) %}
+{% if (active and show_all) or category_filter == cat_name %}
 <div class="section" style="margin-left:14px">
-  <h2>{{ cat.icon if cat else '📁' }} {{ cat_name }}</h2>
+  <h2>{{ cat.icon or '📁' }} {{ cat_name }}</h2>
   <a class="btn btn-sm" href="{{ url_for('new_note', category=cat_name) }}">+ Note</a>
 </div>
 {% for note in active %}
-<div class="card{% if cat and cat.color %} cat-stripe{% endif %}"
-     {% if cat and cat.color %}style="border-left-color:{{ cat.color }};margin-left:14px"{% else %}style="margin-left:14px"{% endif %}>
+<div class="card{% if cat.color %} cat-stripe{% endif %}"
+     {% if cat.color %}style="border-left-color:{{ cat.color }};margin-left:14px"{% else %}style="margin-left:14px"{% endif %}>
   <div class="card-body">
     <div class="card-title"><a href="{{ url_for('view', rel=rrel(note.path), type='note') }}">{{ note.title }}</a></div>
     <div class="card-meta">
@@ -952,8 +991,10 @@ _INDEX = _BASE + """
   </div>
 </div>
 {% endfor %}
+{% if category_filter == cat_name and not active %}<p class="empty" style="margin-left:14px">No items in this type yet.</p>{% endif %}
 {% endif %}
 {% endfor %}
+</section>
 </main>"""
 
 _VIEW = _BASE + """
@@ -1434,8 +1475,17 @@ def create_app(root: Path) -> Flask:
     @require_login
     def index():
         store = get_store()
-        return render_template_string(_INDEX, data=store.load_for_user(session['username']),
-                                      flash=flash_msg(), **ctx())
+        data = store.load_for_user(session['username'])
+        active_filter = request.args.get('filter', 'all')
+        if active_filter not in {'all', 'tasks', 'notes'} and not active_filter.startswith('cat:'):
+            active_filter = 'all'
+        nav_categories = list(data.get('categories', []))
+        known_category_names = {cat.name for cat in nav_categories}
+        for cat_name in data.get('category_notes', {}):
+            if cat_name not in known_category_names:
+                nav_categories.append(CustomCategory(name=cat_name, icon='📁', color=None))
+        return render_template_string(_INDEX, data=data, nav_categories=nav_categories,
+                                      active_filter=active_filter, flash=flash_msg(), **ctx())
 
     @app.route('/view')
     @require_login
