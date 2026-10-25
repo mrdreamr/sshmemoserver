@@ -11,8 +11,11 @@ Usage (run from the SSHMemo root directory):
 Authentication:
     Users are configured by the SSHMemo app via .sshmemo_web.meta in the root
     folder. If no users are configured, the server accepts no logins.
-    Each user's password is their note passphrase (also used to decrypt private
-    files). The meta file stores passwords as base64-encoded strings.
+    The meta file stores passwords as base64-encoded strings.
+
+Private items:
+    Private items are encrypted by the device that created them and are never
+    decrypted here. The web UI lists them by name only.
 
 Install:
     pip install sshmemo-server
@@ -24,12 +27,11 @@ import argparse
 import base64
 import functools
 import hmac
-import os
 import re
 import secrets
 import time
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -48,14 +50,6 @@ except ImportError:
 _USERS_META = '.sshmemo_web.meta'
 
 try:
-    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-    from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
-    from cryptography.hazmat.primitives import hashes
-    CRYPTO_AVAILABLE = True
-except ImportError:
-    CRYPTO_AVAILABLE = False
-
-try:
     import markdown as md_lib
 except ImportError:
     raise SystemExit("markdown is required: pip install markdown")
@@ -68,48 +62,6 @@ except ImportError:
     _NH3_AVAILABLE = False
 
 
-# ── Crypto (mirrors ItemCryptoAndroid exactly) ─────────────────────────────
-# Wire format: [16-byte salt][12-byte IV][ciphertext + 16-byte GCM tag]
-
-_SALT_LEN = 16
-_IV_LEN = 12
-_TAG_BYTES = 16
-_PBKDF2_ITERATIONS = 100_000
-_KEY_BYTES = 32  # 256 bits
-
-
-def _derive_key(passphrase: str, salt: bytes) -> bytes:
-    kdf = PBKDF2HMAC(
-        algorithm=hashes.SHA256(),
-        length=_KEY_BYTES,
-        salt=salt,
-        iterations=_PBKDF2_ITERATIONS,
-    )
-    return kdf.derive(passphrase.encode())
-
-
-def decrypt_file(ciphertext: bytes, passphrase: str) -> Optional[bytes]:
-    if not CRYPTO_AVAILABLE:
-        return None
-    if len(ciphertext) < _SALT_LEN + _IV_LEN + _TAG_BYTES:
-        return None
-    salt = ciphertext[:_SALT_LEN]
-    iv = ciphertext[_SALT_LEN:_SALT_LEN + _IV_LEN]
-    data = ciphertext[_SALT_LEN + _IV_LEN:]
-    try:
-        return AESGCM(_derive_key(passphrase, salt)).decrypt(iv, data, None)
-    except Exception:
-        return None
-
-
-def encrypt_file(plaintext: bytes, passphrase: str) -> bytes:
-    if not CRYPTO_AVAILABLE:
-        raise RuntimeError("pip install cryptography")
-    salt = os.urandom(_SALT_LEN)
-    iv = os.urandom(_IV_LEN)
-    return salt + iv + AESGCM(_derive_key(passphrase, salt)).encrypt(iv, plaintext, None)
-
-
 # ── Filename utils (mirrors FilenameUtils.kt) ──────────────────────────────
 
 def _slug(title: str) -> str:
@@ -118,6 +70,18 @@ def _slug(title: str) -> str:
     s = re.sub(r'\s+', '_', s)
     s = s.lower()[:80].rstrip('_.')
     return s or 'untitled'
+
+
+def is_private_path(path: Path) -> bool:
+    """Private items are .<slug>.enc files (mirrors isPrivateRemotePath)."""
+    return path.name.startswith('.') and path.name.endswith('.enc')
+
+
+def item_stem(filename: str) -> str:
+    """bar.md, .bar.md and .bar.enc → bar (mirrors the app's stem handling)."""
+    name = filename[:-4] if filename.endswith('.enc') else filename
+    name = name[:-3] if name.endswith('.md') else name
+    return name.lstrip('.')
 
 
 def task_filename(title: str) -> str:
@@ -154,12 +118,30 @@ def format_reminder_stamp(epoch_ms: int) -> str:
 
 
 def parse_reminder_stamp(stamp: str) -> Optional[int]:
-    for fmt in ("%Y-%m-%dT%H:%M",):
+    # ISO format, plus the legacy DDMMYYYYTHH:MM form still accepted by the app
+    for fmt in ("%Y-%m-%dT%H:%M", "%d%m%YT%H:%M"):
         try:
             return int(datetime.strptime(stamp.strip(), fmt).timestamp() * 1000)
         except ValueError:
             pass
     return None
+
+
+def format_calendar_date_stamp(epoch_ms: int) -> str:
+    """YYYY-MM-DD — date-only calendar stamp (no alarm)."""
+    return datetime.fromtimestamp(epoch_ms / 1000).strftime("%Y-%m-%d")
+
+
+def parse_calendar_stamp(stamp: str) -> Optional[int]:
+    """Datetime stamp, or a date-only stamp mapped to local noon (mirrors parseCalendarStamp)."""
+    ms = parse_reminder_stamp(stamp)
+    if ms is not None:
+        return ms
+    try:
+        d = datetime.strptime(stamp.strip(), "%Y-%m-%d")
+    except ValueError:
+        return None
+    return int(d.replace(hour=12).timestamp() * 1000)
 
 
 def format_reminder_display(epoch_ms: int) -> str:
@@ -187,6 +169,10 @@ class Task:
     done: bool = False
     sync_mode: str = "NORMAL"
     remind_at: Optional[int] = None
+    end_at: Optional[int] = None
+    assigned_to: Optional[str] = None
+    calendar_icon: Optional[str] = None
+    hide_until_reminder: bool = False
     edited_at: int = field(default_factory=lambda: int(time.time() * 1000))
     deleted_at: Optional[int] = None
     category: Optional[str] = None
@@ -201,11 +187,60 @@ class Note:
     content: str = ""
     sync_mode: str = "NORMAL"
     remind_at: Optional[int] = None
+    end_at: Optional[int] = None
+    assigned_to: Optional[str] = None
+    calendar_icon: Optional[str] = None
+    hide_until_reminder: bool = False
     edited_at: int = field(default_factory=lambda: int(time.time() * 1000))
     deleted_at: Optional[int] = None
     category: Optional[str] = None
     edited_by: Optional[str] = None
     attachments: list = field(default_factory=list)
+    path: Optional[Path] = field(default=None, repr=False)
+
+
+@dataclass
+class CalendarItem:
+    """Calendar-only event (mirrors CalendarItem.kt). No done state."""
+    title: str
+    description: str = ""
+    sync_mode: str = "NORMAL"
+    remind_at: Optional[int] = None
+    end_at: Optional[int] = None
+    all_day: bool = True  # app's alarmEnabled == not all_day
+    repeat_days: Optional[int] = None
+    assigned_to: Optional[str] = None
+    calendar_icon: Optional[str] = None
+    hide_until_reminder: bool = False
+    edited_at: int = field(default_factory=lambda: int(time.time() * 1000))
+    deleted_at: Optional[int] = None
+    category: Optional[str] = None
+    edited_by: Optional[str] = None
+    attachments: list = field(default_factory=list)
+    path: Optional[Path] = field(default=None, repr=False)
+
+
+@dataclass
+class PrivateItem:
+    """An encrypted .<slug>.enc file from a device. Only its name is known to the server."""
+    title: str
+    kind: str  # 'task' | 'note' | 'calendar'
+    edited_at: Optional[int] = None
+    edited_by: Optional[str] = None
+    path: Optional[Path] = field(default=None, repr=False)
+
+
+@dataclass
+class RepeatedCalendarItem:
+    """Repeated calendar event from repeated_todo/ (Type: calendar). Displayed read-only."""
+    title: str
+    start_at: int
+    repeat_days: int = 0
+    repeat_by_date: bool = False
+    sync_mode: str = "NORMAL"
+    calendar_icon: Optional[str] = None
+    deleted_at: Optional[int] = None
+    edited_by: Optional[str] = None
     path: Optional[Path] = field(default=None, repr=False)
 
 
@@ -242,7 +277,26 @@ def _parse_meta_lines(lines: list[str], start: int) -> tuple[dict, int]:
             if val(8).lower() == 'true':
                 meta['sync_mode'] = 'PRIVATE'
         elif lo.startswith("remind:"):
-            meta['remind_at'] = parse_reminder_stamp(val(7))
+            meta['remind_at'] = parse_calendar_stamp(val(7))
+            meta['remind_has_time'] = 'T' in val(7)
+        elif lo.startswith("end:"):
+            meta['end_at'] = parse_calendar_stamp(val(4))
+        elif lo.startswith("start:"):
+            meta['start_at'] = parse_calendar_stamp(val(6))
+        elif lo.startswith("repeat:"):
+            v = val(7)
+            if v.lower() == 'date':
+                meta['repeat_by_date'] = True
+            elif v.isdigit() and int(v) > 0:
+                meta['repeat_days'] = int(v)
+        elif lo.startswith("type:"):
+            meta['type'] = val(5).lower()
+        elif lo.startswith("assignedto:"):
+            meta['assigned_to'] = val(11) or None
+        elif lo.startswith("calendaricon:"):
+            meta['calendar_icon'] = val(13) or None
+        elif lo.startswith("hideuntilreminder:"):
+            meta['hide_until_reminder'] = val(18).lower() == 'true'
         elif lo.startswith("deletedat:"):
             v = val(10)
             meta['deleted_at'] = int(v) if v.isdigit() else None
@@ -285,6 +339,10 @@ def parse_task(text: str) -> Optional[Task]:
         done=meta.get('done', False),
         sync_mode=meta.get('sync_mode', 'NORMAL'),
         remind_at=meta.get('remind_at'),
+        end_at=meta.get('end_at'),
+        assigned_to=meta.get('assigned_to'),
+        calendar_icon=meta.get('calendar_icon'),
+        hide_until_reminder=meta.get('hide_until_reminder', False),
         edited_at=meta.get('edited_at', int(time.time() * 1000)),
         deleted_at=meta.get('deleted_at'),
         category=meta.get('category'),
@@ -307,11 +365,105 @@ def parse_note(text: str) -> Optional[Note]:
         content=body,
         sync_mode=meta.get('sync_mode', 'NORMAL'),
         remind_at=meta.get('remind_at'),
+        end_at=meta.get('end_at'),
+        assigned_to=meta.get('assigned_to'),
+        calendar_icon=meta.get('calendar_icon'),
+        hide_until_reminder=meta.get('hide_until_reminder', False),
         edited_at=meta.get('edited_at', int(time.time() * 1000)),
         deleted_at=meta.get('deleted_at'),
         category=meta.get('category'),
         edited_by=meta.get('edited_by'),
         attachments=meta.get('attachments', []),
+    )
+
+
+def _calendar_field_lines(item, end_stamp: Optional[str] = None) -> list[str]:
+    """End/AssignedTo/CalendarIcon/HideUntilReminder header lines, in the app's order."""
+    lines = []
+    if item.end_at:
+        lines.append(f"End: {end_stamp or format_reminder_stamp(item.end_at)}")
+    if item.assigned_to and item.assigned_to.strip():
+        lines.append(f"AssignedTo: {item.assigned_to.strip()}")
+    if item.calendar_icon and item.calendar_icon.strip():
+        lines.append(f"CalendarIcon: {item.calendar_icon.strip()}")
+    if item.hide_until_reminder:
+        lines.append("HideUntilReminder: true")
+    return lines
+
+
+def parse_calendar_item(text: str) -> Optional[CalendarItem]:
+    lines = text.splitlines()
+    if not lines or not lines[0].startswith('#'):
+        return None
+    title = lines[0].lstrip('# ').strip()
+    if not title:
+        return None
+    meta, body_start = _parse_meta_lines(lines, 1)
+    body = "\n".join(lines[body_start:]).strip()
+    return CalendarItem(
+        title=title,
+        description=body,
+        sync_mode=meta.get('sync_mode', 'NORMAL'),
+        remind_at=meta.get('remind_at'),
+        end_at=meta.get('end_at'),
+        all_day=not meta.get('remind_has_time', False),
+        repeat_days=meta.get('repeat_days'),
+        assigned_to=meta.get('assigned_to'),
+        calendar_icon=meta.get('calendar_icon'),
+        hide_until_reminder=meta.get('hide_until_reminder', False),
+        edited_at=meta.get('edited_at', int(time.time() * 1000)),
+        deleted_at=meta.get('deleted_at'),
+        category=meta.get('category'),
+        edited_by=meta.get('edited_by'),
+        attachments=meta.get('attachments', []),
+    )
+
+
+def calendar_item_to_markdown(item: CalendarItem) -> str:
+    """Mirrors CalendarItemMarkdownMapper.toMarkdown: date-only stamps unless the item has a time,
+    and a repeat's End (repeat-until) is always date-only. Repeat goes last in the header."""
+    lines = [f"# {item.title.strip()}"]
+    if item.sync_mode == 'DISABLED':
+        lines.append("Sync: false")
+    elif item.sync_mode == 'SHARED':
+        lines.append("Shared: true")
+    elif item.sync_mode == 'PRIVATE':
+        lines.append("Private: true")
+    if item.remind_at:
+        stamp = format_calendar_date_stamp(item.remind_at) if item.all_day else format_reminder_stamp(item.remind_at)
+        lines.append(f"Remind: {stamp}")
+    end_stamp = None
+    if item.end_at and (item.repeat_days or item.all_day):
+        end_stamp = format_calendar_date_stamp(item.end_at)
+    lines.extend(_calendar_field_lines(item, end_stamp))
+    if item.category:
+        lines.append(f"Category: {item.category}")
+    for a in item.attachments:
+        lines.append(f"Attachment: {a.id}|{a.mime_type}|{a.remote_name}|{a.updated_at}")
+    if item.repeat_days and item.repeat_days > 0:
+        lines.append(f"Repeat: {item.repeat_days}")
+    lines.append("")
+    lines.append(item.description.strip())
+    return "\n".join(lines)
+
+
+def parse_repeated_calendar(text: str) -> Optional[RepeatedCalendarItem]:
+    lines = text.splitlines()
+    if not lines or not lines[0].startswith('#'):
+        return None
+    title = lines[0].lstrip('# ').strip()
+    meta, _ = _parse_meta_lines(lines, 1)
+    if not title or meta.get('type') != 'calendar' or not meta.get('start_at'):
+        return None
+    return RepeatedCalendarItem(
+        title=title,
+        start_at=meta['start_at'],
+        repeat_days=meta.get('repeat_days') or 0,
+        repeat_by_date=meta.get('repeat_by_date', False),
+        sync_mode=meta.get('sync_mode', 'NORMAL'),
+        calendar_icon=meta.get('calendar_icon'),
+        deleted_at=meta.get('deleted_at'),
+        edited_by=meta.get('edited_by'),
     )
 
 
@@ -327,6 +479,7 @@ def task_to_markdown(task: Task) -> str:
         lines.append("Private: true")
     if task.remind_at:
         lines.append(f"Remind: {format_reminder_stamp(task.remind_at)}")
+    lines.extend(_calendar_field_lines(task))
     if task.category:
         lines.append(f"Category: {task.category}")
     for a in task.attachments:
@@ -346,6 +499,7 @@ def note_to_markdown(note: Note) -> str:
         lines.append("Private: true")
     if note.remind_at:
         lines.append(f"Remind: {format_reminder_stamp(note.remind_at)}")
+    lines.extend(_calendar_field_lines(note))
     for a in note.attachments:
         lines.append(f"Attachment: {a.id}|{a.mime_type}|{a.remote_name}|{a.updated_at}")
     if note.category:
@@ -355,45 +509,56 @@ def note_to_markdown(note: Note) -> str:
     return "\n".join(lines)
 
 
+def parse_item(text: str, itype: str):
+    if itype == 'task':
+        return parse_task(text)
+    if itype == 'calendar':
+        return parse_calendar_item(text)
+    return parse_note(text)
+
+
+def item_to_markdown(item, itype: str) -> str:
+    if itype == 'task':
+        return task_to_markdown(item)
+    if itype == 'calendar':
+        return calendar_item_to_markdown(item)
+    return note_to_markdown(item)
+
+
+def item_body(item, itype: str) -> str:
+    return item.content if itype == 'note' else item.description
+
+
+# The server cannot encrypt, so it only offers these; private items stay on their device.
+_WEB_SYNC_MODES = ('NORMAL', 'SHARED', 'DISABLED')
+
+
+def web_sync_mode(value: Optional[str]) -> str:
+    return value if value in _WEB_SYNC_MODES else 'NORMAL'
+
+
 # ── File store ─────────────────────────────────────────────────────────────
 
 class FileStore:
     """Reads/writes SSHMemo .md files using the same layout as the app."""
 
-    def __init__(self, root: Path, passphrase: Optional[str] = None):
+    def __init__(self, root: Path):
         self.root = root
-        self.passphrase = passphrase
 
     # ── I/O helpers ────────────────────────────────────────────────────────
 
     def read_text(self, path: Path) -> Optional[str]:
+        if is_private_path(path):
+            return None  # encrypted by its device; never read here
         try:
-            raw = path.read_bytes()
+            return path.read_bytes().decode('utf-8', errors='replace')
         except OSError:
             return None
-        if path.name.startswith('.') and not path.name.endswith('.meta'):
-            # Try decryption first (private files); fall back to plain text
-            # (dot-prefixed deleted files that were not private).
-            if self.passphrase:
-                plain = decrypt_file(raw, self.passphrase)
-                if plain is not None:
-                    return plain.decode('utf-8', errors='replace')
-            # Not encrypted — read as plain text
-            try:
-                return raw.decode('utf-8', errors='replace')
-            except Exception:
-                return None
-        return raw.decode('utf-8', errors='replace')
 
-    def write_text(self, path: Path, text: str, private: bool = False) -> None:
+    def write_text(self, path: Path, text: str) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
-        data = text.encode('utf-8')
-        if private:
-            if not self.passphrase:
-                raise ValueError("Passphrase required to write private files")
-            data = encrypt_file(data, self.passphrase)
         tmp = path.with_suffix('.tmp')
-        tmp.write_bytes(data)
+        tmp.write_bytes(text.encode('utf-8'))
         tmp.replace(path)
 
     def safe_abs(self, rel: str) -> Path:
@@ -408,10 +573,8 @@ class FileStore:
 
     @staticmethod
     def _sidecar_path(md_path: Path) -> Path:
-        """foo/bar.md and foo/.bar.md both → foo/.bar.meta"""
-        stem = md_path.name[:-3] if md_path.name.endswith('.md') else md_path.name
-        stem = stem.lstrip('.')  # normalise: .bar.md and bar.md share a sidecar
-        return md_path.parent / f'.{stem}.meta'
+        """foo/bar.md, foo/.bar.md and foo/.bar.enc all → foo/.bar.meta"""
+        return md_path.parent / f'.{item_stem(md_path.name)}.meta'
 
     def read_sidecar(self, md_path: Path) -> dict:
         """Read sidecar and return dict with any of: edited_at, edited_by, deleted_at."""
@@ -484,9 +647,9 @@ class FileStore:
                     task.edited_by = sc['edited_by']
                 if 'deleted_at' in sc:
                     task.deleted_at = sc['deleted_at']
-                # Only treat dot-prefix as private if the item is not deleted
+                # A hidden .md is a deleted copy, even without a deletion stamp
                 if path.name.startswith('.') and not task.deleted_at:
-                    task.sync_mode = 'PRIVATE'
+                    task.deleted_at = task.edited_at
                 tasks.append(task)
         return tasks
 
@@ -506,11 +669,81 @@ class FileStore:
                     note.edited_by = sc['edited_by']
                 if 'deleted_at' in sc:
                     note.deleted_at = sc['deleted_at']
-                # Only treat dot-prefix as private if the item is not deleted
+                # A hidden .md is a deleted copy, even without a deletion stamp
                 if path.name.startswith('.') and not note.deleted_at:
-                    note.sync_mode = 'PRIVATE'
+                    note.deleted_at = note.edited_at
                 notes.append(note)
         return notes
+
+    def load_private(self, folder: Path, kind: str) -> list[PrivateItem]:
+        """Name-only entries for a device's encrypted items; the title comes from the filename."""
+        items = []
+        if not folder.is_dir():
+            return items
+        for path in sorted(folder.iterdir()):
+            if not path.is_file() or not is_private_path(path):
+                continue
+            sc = self.read_sidecar(path)
+            if sc.get('deleted_at'):
+                continue
+            items.append(PrivateItem(title=item_stem(path.name).replace('_', ' '), kind=kind,
+                                     edited_at=sc.get('edited_at'), edited_by=sc.get('edited_by'),
+                                     path=path))
+        return items
+
+    def load_calendar(self, folder: Path) -> list[CalendarItem]:
+        items = []
+        for path in self._md_files(folder):
+            text = self.read_text(path)
+            if text is None:
+                continue
+            item = parse_calendar_item(text)
+            if item is None:
+                continue
+            item.path = path
+            sc = self.read_sidecar(path)
+            if 'edited_at' in sc:
+                item.edited_at = sc['edited_at']
+            if 'edited_by' in sc:
+                item.edited_by = sc['edited_by']
+            if 'deleted_at' in sc:
+                item.deleted_at = sc['deleted_at']
+            if path.name.startswith('.') and not item.deleted_at:
+                # Hidden .md without a deletion stamp is still a removed copy
+                item.deleted_at = item.edited_at
+            items.append(item)
+        return items
+
+    def load_repeated_calendar(self, folder: Path) -> list[RepeatedCalendarItem]:
+        items = []
+        if not folder.is_dir():
+            return items
+        for path in sorted(folder.iterdir()):
+            if not path.is_file() or not path.name.endswith('.md') or path.name.startswith('.'):
+                continue  # private (.enc) or deleted (.md) copy
+            text = self.read_text(path)
+            item = parse_repeated_calendar(text) if text else None
+            if item is None:
+                continue
+            sc = self.read_sidecar(path)
+            if 'deleted_at' in sc:
+                item.deleted_at = sc['deleted_at']
+            if 'edited_by' in sc:
+                item.edited_by = sc['edited_by']
+            if item.deleted_at:
+                continue
+            item.path = path
+            items.append(item)
+        return items
+
+    def calendar_path(self, item: CalendarItem, user: str) -> Path:
+        """Mirrors calendarRemotePath: shared/calendar or <user>/calendar."""
+        filename = note_filename(item.title)
+        if item.sync_mode == 'SHARED' or not sanitize_user_folder(user):
+            folder = self.root / 'shared' / 'calendar'
+        else:
+            folder = self.root / sanitize_user_folder(user) / 'calendar'
+        return folder / filename
 
     def load_categories(self, user_dir: Path) -> list[CustomCategory]:
         path = user_dir / 'custom' / '.categories.meta'
@@ -584,9 +817,7 @@ class FileStore:
 
     def write_task(self, task: Task, user: Optional[str], shared: bool) -> Path:
         task.edited_at = int(time.time() * 1000)
-        private = task.sync_mode == 'PRIVATE'
-        prefix = '.' if private else ''
-        filename = f"{prefix}{task_filename(task.title)}"
+        filename = task_filename(task.title)
         if shared or task.sync_mode == 'SHARED':
             folder = self.root / 'shared' / 'todo'
         elif user:
@@ -594,16 +825,14 @@ class FileStore:
         else:
             folder = self.root / 'shared' / 'todo'
         path = folder / filename
-        self.write_text(path, task_to_markdown(task), private=private)
+        self.write_text(path, task_to_markdown(task))
         self.write_sidecar(path, task.edited_at, task.edited_by, task.deleted_at)
         task.path = path
         return path
 
     def write_note(self, note: Note, user: Optional[str], shared: bool) -> Path:
         note.edited_at = int(time.time() * 1000)
-        private = note.sync_mode == 'PRIVATE'
-        prefix = '.' if private else ''
-        filename = f"{prefix}{note_filename(note.title)}"
+        filename = note_filename(note.title)
         cat = note.category
         if cat and not shared and note.sync_mode != 'SHARED':
             folder = self.root / sanitize_user_folder(user or 'shared') / 'custom' / sanitize_cat_folder(cat)
@@ -614,10 +843,25 @@ class FileStore:
         else:
             folder = self.root / 'shared' / 'note'
         path = folder / filename
-        self.write_text(path, note_to_markdown(note), private=private)
+        self.write_text(path, note_to_markdown(note))
         self.write_sidecar(path, note.edited_at, note.edited_by, note.deleted_at)
         note.path = path
         return path
+
+    def write_calendar(self, item: CalendarItem, path: Path) -> Path:
+        self.write_text(path, calendar_item_to_markdown(item))
+        self.write_sidecar(path, item.edited_at, item.edited_by, item.deleted_at)
+        item.path = path
+        return path
+
+    def move_attachments(self, old_path: Path, new_path: Path) -> None:
+        """Move the slug/ attachment folder alongside a renamed item file."""
+        old_dir = old_path.parent / item_stem(old_path.name)
+        new_dir = new_path.parent / item_stem(new_path.name)
+        if old_dir == new_dir or not old_dir.is_dir() or new_dir.exists():
+            return
+        new_dir.parent.mkdir(parents=True, exist_ok=True)
+        old_dir.rename(new_dir)
 
     def mark_deleted(self, path: Path) -> Path:
         """Dot-prefix the file (making it invisible) and stamp deleted_at in sidecar.
@@ -632,7 +876,7 @@ class FileStore:
 
         # Rename to dot-prefixed path if not already
         if path.name.startswith('.'):
-            dest = path  # already hidden (was private)
+            dest = path  # already hidden
         else:
             dest = path.parent / f'.{path.name}'
             if dest.exists():
@@ -664,14 +908,113 @@ class FileStore:
             'user_notes': self.load_notes(user_dir / 'note'),
             'categories': cats,
             'category_notes': cat_notes,
+            'private_tasks': self.load_private(user_dir / 'todo', 'task'),
+            'private_notes': self.load_private(user_dir / 'note', 'note'),
+            'private_calendar': self.load_private(user_dir / 'calendar', 'calendar'),
+            'shared_calendar': self.load_calendar(shared / 'calendar'),
+            'user_calendar': self.load_calendar(user_dir / 'calendar'),
+            'repeated_calendar': (self.load_repeated_calendar(shared / 'repeated_todo')
+                                  + self.load_repeated_calendar(user_dir / 'repeated_todo')),
         }
+
+
+# ── Calendar layout (mirrors CalendarReminder.kt) ───────────────────────────
+
+def _local_date(epoch_ms: int) -> date:
+    return datetime.fromtimestamp(epoch_ms / 1000).date()
+
+
+def _occurrence_dates(start: date, first: date, last: date, end: Optional[date] = None,
+                      repeat_days: Optional[int] = None, until: Optional[date] = None,
+                      repeat_by_date: bool = False) -> list[date]:
+    """Dates in [first, last] on which an entry is drawn: a single day, a start..end range,
+    every N days from start (until the optional cutoff), or yearly on the same date."""
+    if repeat_by_date:
+        out = []
+        for year in range(max(start.year, first.year), last.year + 1):
+            try:
+                d = start.replace(year=year)
+            except ValueError:
+                continue  # 29 Feb in a non-leap year
+            if first <= d <= last:
+                out.append(d)
+        return out
+    if repeat_days and repeat_days > 0:
+        stop = min(last, until) if until else last
+        k = max(0, -(-(first - start).days // repeat_days))
+        out = []
+        d = start + timedelta(days=k * repeat_days)
+        while d <= stop:
+            out.append(d)
+            d += timedelta(days=repeat_days)
+        return out
+    end = end if end and end >= start else start
+    lo, hi = max(start, first), min(end, last)
+    return [lo + timedelta(days=i) for i in range((hi - lo).days + 1)] if lo <= hi else []
+
+
+def calendar_entries(data: dict) -> list[dict]:
+    """Everything the calendar draws: calendar items, open tasks and notes with a reminder,
+    and repeated calendar events."""
+    entries = []
+
+    def add(kind, item, rel_path, time_text, **extra):
+        entries.append(dict(kind=kind, title=item.title, rel=rel_path, time=time_text,
+                            icon=getattr(item, 'calendar_icon', None), sync_mode=item.sync_mode,
+                            assigned_to=getattr(item, 'assigned_to', None),
+                            edited_by=item.edited_by, **extra))
+
+    for item in data.get('shared_calendar', []) + data.get('user_calendar', []):
+        if item.deleted_at or not item.remind_at:
+            continue
+        repeat = item.repeat_days if item.repeat_days and item.repeat_days > 0 else None
+        add('calendar', item, item.path, '' if item.all_day else datetime.fromtimestamp(item.remind_at / 1000).strftime('%H:%M'),
+            start=_local_date(item.remind_at),
+            end=None if repeat or not item.end_at else _local_date(item.end_at),
+            repeat_days=repeat,
+            until=_local_date(item.end_at) if repeat and item.end_at else None,
+            sort=item.remind_at)
+    for task in data.get('shared_tasks', []) + data.get('user_tasks', []):
+        if task.deleted_at or task.done or not task.remind_at:
+            continue
+        add('task', task, task.path, datetime.fromtimestamp(task.remind_at / 1000).strftime('%H:%M'),
+            start=_local_date(task.remind_at),
+            end=_local_date(task.end_at) if task.end_at else None, sort=task.remind_at)
+    notes = data.get('shared_notes', []) + data.get('user_notes', [])
+    for cat_notes in data.get('category_notes', {}).values():
+        notes = notes + cat_notes
+    for note in notes:
+        if note.deleted_at or not note.remind_at:
+            continue
+        add('note', note, note.path, datetime.fromtimestamp(note.remind_at / 1000).strftime('%H:%M'),
+            start=_local_date(note.remind_at),
+            end=_local_date(note.end_at) if note.end_at else None, sort=note.remind_at)
+    for rep in data.get('repeated_calendar', []):
+        add('repeated', rep, rep.path, '', start=_local_date(rep.start_at),
+            repeat_days=None if rep.repeat_by_date else rep.repeat_days,
+            repeat_by_date=rep.repeat_by_date, sort=rep.start_at)
+    return entries
+
+
+def calendar_by_day(entries: list[dict], first: date, last: date) -> dict:
+    """{date: [entry, ...]} for each day in [first, last], sorted by time-of-day then title."""
+    kind_order = {'task': 0, 'note': 1, 'calendar': 2, 'repeated': 3}
+    days: dict = {}
+    for e in entries:
+        for d in _occurrence_dates(e['start'], first, last, end=e.get('end'),
+                                   repeat_days=e.get('repeat_days'), until=e.get('until'),
+                                   repeat_by_date=e.get('repeat_by_date', False)):
+            days.setdefault(d, []).append(e)
+    for items in days.values():
+        items.sort(key=lambda e: (e['time'] or '', kind_order[e['kind']], e['title'].lower()))
+    return days
 
 
 # ── User registry ───────────────────────────────────────────────────────────
 
 def load_web_users(root: Path) -> dict[str, str]:
     """
-    Read {root}/.sshmemo_web.meta and return {username: passphrase}.
+    Read {root}/.sshmemo_web.meta and return {username: password}.
     Each line format: webuser|username|base64_password
     Returns empty dict if the file does not exist (no logins accepted).
     """
@@ -687,17 +1030,19 @@ def load_web_users(root: Path) -> dict[str, str]:
         if len(parts) >= 3 and parts[0] == 'webuser':
             username = parts[1].strip()
             try:
-                passphrase = base64.b64decode(parts[2].strip()).decode('utf-8')
+                password = base64.b64decode(parts[2].strip()).decode('utf-8')
             except Exception:
                 continue
             if username:
-                users[username] = passphrase
+                users[username] = password
     return users
 
 
 # ── HTML templates ─────────────────────────────────────────────────────────
 
-_STYLE = """<link rel="icon" type="image/png" href="{{ url_for('favicon') }}">
+_STYLE = """<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SSHMemo</title>
+<link rel="icon" type="image/png" href="{{ url_for('favicon') }}">
 <style>
 :root{--bg:#f4f4f8;--sur:#ffffff;--sur2:#f0f0f5;--txt:#1a1a2e;--mut:#667;
   --acc:#2274a5;--bdr:#dde;--rad:8px;--sha:0 1px 4px rgba(0,0,0,.1);
@@ -713,12 +1058,15 @@ body{font-family:system-ui,sans-serif;background:var(--bg);color:var(--txt);font
 a{color:var(--acc);text-decoration:none}a:hover{text-decoration:underline}
 nav{background:var(--sur);border-bottom:1px solid var(--bdr);padding:0 16px;display:flex;
   align-items:center;gap:12px;height:52px;position:sticky;top:0;z-index:100;box-shadow:var(--sha)}
-nav .brand{font-weight:700;font-size:18px;flex-shrink:0}
 nav a{color:var(--txt);font-size:14px;padding:4px 8px;border-radius:4px;white-space:nowrap}
 nav a:hover{background:var(--sur2);text-decoration:none}
+nav a.brand{font-weight:700;font-size:18px;flex-shrink:0;display:flex;align-items:center;gap:6px;padding-left:0}
+nav a.brand:hover{background:none}
 nav .sp{flex:1}
-nav .root-label{font-size:12px;color:var(--mut);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:220px}
+nav .nav-user{font-size:13px;color:var(--mut);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:160px}
+@media(max-width:480px){nav .nav-label,nav .nav-user{display:none}}
 main{max-width:880px;margin:24px auto;padding:0 16px}
+.dashboard-shell main.dashboard-content{max-width:none;margin:0;padding:0}
 h1{font-size:20px;margin-bottom:16px;font-weight:700}
 .dashboard-shell{max-width:1180px;margin:24px auto;padding:0 16px;display:grid;grid-template-columns:190px minmax(0,1fr);gap:22px;align-items:start}
 .dashboard-content{min-width:0}
@@ -727,7 +1075,12 @@ h1{font-size:20px;margin-bottom:16px;font-weight:700}
 .side-nav a:hover{background:var(--sur2);text-decoration:none}
 .side-nav a.active{background:var(--acc);color:#fff}
 .side-nav-title{font-size:11px;color:var(--mut);font-weight:700;text-transform:uppercase;letter-spacing:.5px;margin:10px 10px 4px}
+.side-actions{display:flex;gap:6px;margin-bottom:6px}
+.side-nav a.side-add{flex:1;text-align:center;background:var(--acc);color:#fff;font-weight:600}
+.side-nav a.side-add:hover{filter:brightness(1.1)}
 @media(max-width:760px){
+  .side-actions{margin:0;flex:0 0 auto}
+  .side-nav a.side-add{flex:0 0 auto}
   .dashboard-shell{display:block;margin-top:16px}
   .side-nav{position:static;margin-bottom:16px;display:flex;gap:6px;overflow-x:auto}
   .side-nav a{flex:0 0 auto}
@@ -745,6 +1098,8 @@ h1{font-size:20px;margin-bottom:16px;font-weight:700}
 .card-meta{font-size:12px;color:var(--mut);margin-top:2px;display:flex;flex-wrap:wrap;gap:6px;align-items:center}
 .tag{font-size:11px;padding:1px 7px;border-radius:10px;white-space:nowrap}
 .tag-pri{background:var(--pri-bg);color:var(--pri-txt)}
+.card.private{background:var(--pri-bg);border-style:dashed}
+.card.private .card-title{color:var(--pri-txt)}
 .tag-shr{background:var(--shr-bg);color:var(--shr-txt)}
 .tag-done{background:var(--done-bg);color:var(--done-txt)}
 .tag-del{background:#f5f5f5;color:#999}
@@ -794,19 +1149,45 @@ textarea{resize:vertical;min-height:240px}
 audio{width:100%;margin-bottom:4px}
 .empty{color:var(--mut);font-size:13px;padding:6px 0}
 .cat-stripe{border-left-width:3px;border-left-style:solid}
+.cal-head{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:12px}
+.cal-head h1{margin:0 8px 0 0;flex:1;min-width:160px}
+.cal{width:100%;border-collapse:collapse;table-layout:fixed;background:var(--sur);
+  border:1px solid var(--bdr);border-radius:var(--rad);box-shadow:var(--sha)}
+.cal th{font-size:11px;color:var(--mut);font-weight:600;padding:6px 2px;text-transform:uppercase}
+.cal th.wk,.cal td.wk{width:34px;font-size:11px;color:var(--mut);text-align:center;font-weight:400}
+.cal td{border:1px solid var(--bdr);vertical-align:top;height:96px;padding:3px;overflow:hidden}
+.cal td.out{background:var(--sur2)}
+.cal td.out .daynum{color:var(--mut)}
+.cal td.sel{outline:2px solid var(--acc);outline-offset:-2px}
+.daynum{display:inline-block;min-width:22px;text-align:center;font-size:12px;font-weight:600;
+  border-radius:11px;color:var(--txt)}
+.daynum:hover{background:var(--sur2);text-decoration:none}
+.today .daynum{background:var(--acc);color:#fff}
+.chip{display:block;font-size:11px;line-height:1.35;margin-top:2px;padding:0 4px;border-radius:4px;
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis;color:var(--txt);background:var(--sur2)}
+.chip:hover{text-decoration:none;filter:brightness(.95)}
+.chip-calendar{background:var(--warn-bg);color:var(--warn-txt)}
+.chip-task{background:var(--done-bg);color:var(--done-txt)}
+.chip-note{background:var(--shr-bg);color:var(--shr-txt)}
+.chip-repeated{background:transparent;border:1px dashed var(--bdr);color:var(--mut)}
+.chip-more{color:var(--mut);background:none}
+.kind{font-size:11px;color:var(--mut);min-width:20px;text-align:center}
+.row2{display:flex;gap:10px}.row2>.fr{flex:1}
+@media(max-width:760px){
+  .cal td{height:58px;padding:2px}
+  .cal th.wk,.cal td.wk{width:22px}
+  .chip{font-size:0;height:6px;padding:0;margin-top:2px}
+  .chip-more{display:none}
+  .row2{display:block}
+}
 </style>"""
 
 _NAV = """<nav>
-  <span class="brand"><img src="{{ url_for('favicon') }}" height="26" style="vertical-align:middle;border-radius:5px;margin-right:6px" alt="">SSHMemo</span>
-  <a href="{{ url_for('index') }}">Dashboard</a>
-  <a href="{{ url_for('new_task') }}">+ Task</a>
-  <a href="{{ url_for('new_note') }}">+ Note</a>
-  <a href="{{ url_for('history') }}">History</a>
-  <a href="{{ url_for('search') }}">🔍 Search</a>
+  <a class="brand" href="{{ url_for('index') }}"><img src="{{ url_for('favicon') }}" height="26" style="border-radius:5px" alt="">SSHMemo</a>
   <span class="sp"></span>
-  <span class="root-label">{{ root_label }}</span>
+  <a href="{{ url_for('search') }}" aria-label="Search">🔍<span class="nav-label"> Search</span></a>
   {% if current_user %}
-  <span style="font-size:13px;color:var(--mut)">👤 {{ current_user }}</span>
+  <span class="nav-user">👤 {{ current_user }}</span>
   <form class="il" method="post" action="{{ url_for('logout') }}">
     <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
     <button class="btn btn-sm" style="font-size:12px">Log out</button>
@@ -814,7 +1195,43 @@ _NAV = """<nav>
   {% endif %}
 </nav>"""
 
-_BASE = _STYLE + _NAV
+_SIDE = """<aside class="side-nav" aria-label="Navigation">
+  <div class="side-actions">
+    <a class="side-add" href="{{ url_for('new_task') }}">+ Task</a>
+    <a class="side-add" href="{{ url_for('new_note') }}">+ Note</a>
+  </div>
+  <div class="side-nav-title">Views</div>
+  <a class="{{ 'active' if nav_active == 'all' }}" href="{{ url_for('index') }}">All items</a>
+  <a class="{{ 'active' if nav_active == 'tasks' }}" href="{{ url_for('index', filter='tasks') }}">Todo</a>
+  <a class="{{ 'active' if nav_active == 'notes' }}" href="{{ url_for('index', filter='notes') }}">Notes</a>
+  <a class="{{ 'active' if nav_active == 'calendar' }}" href="{{ url_for('calendar') }}">Calendar</a>
+  {% if nav_categories %}<div class="side-nav-title">Custom</div>{% endif %}
+  {% for cat in nav_categories %}
+    <a class="{{ 'active' if nav_active == 'cat:' ~ cat.name }}" href="{{ url_for('index', filter='cat:' ~ cat.name) }}">
+      {{ cat.icon or '📁' }} {{ cat.name }}
+    </a>
+  {% endfor %}
+  <div class="side-nav-title">Archive</div>
+  <a class="{{ 'active' if nav_active == 'history' }}" href="{{ url_for('history') }}">History</a>
+</aside>"""
+
+_MACROS = """{% macro private_card(p) %}
+<div class="card private">
+  <span class="kind">🔒</span>
+  <div class="card-body">
+    <div class="card-title">{{ p.title }}</div>
+    <div class="card-meta">
+      <span class="tag tag-pri">private</span>
+      <span>Encrypted — open it in the SSHMemo app on the device that created it.</span>
+    </div>
+  </div>
+</div>
+{% endmacro %}"""
+
+# Every signed-in page: top bar, left navigation, then the page's own content.
+_BASE = (_STYLE + _MACROS + _NAV
+         + '<div class="dashboard-shell">' + _SIDE + '<main class="dashboard-content">')
+_END = '</main></div>'
 
 _LOGIN = _STYLE + """
 <main style="max-width:380px;margin:80px auto;padding:0 16px">
@@ -834,7 +1251,7 @@ _LOGIN = _STYLE + """
       <div class="fr"><label>Username</label>
         <input type="text" name="username" autocomplete="username" autofocus required>
       </div>
-      <div class="fr"><label>Password (note passphrase)</label>
+      <div class="fr"><label>Password</label>
         <input type="password" name="password" autocomplete="current-password" required>
       </div>
       <button type="submit" class="btn btn-primary" style="width:100%;margin-top:4px">Sign in</button>
@@ -844,19 +1261,6 @@ _LOGIN = _STYLE + """
 </main>"""
 
 _INDEX = _BASE + """
-<main class="dashboard-shell">
-<aside class="side-nav" aria-label="Item type filter">
-  <a class="{{ 'active' if active_filter == 'all' }}" href="{{ url_for('index') }}">All items</a>
-  <a class="{{ 'active' if active_filter == 'tasks' }}" href="{{ url_for('index', filter='tasks') }}">Todo</a>
-  <a class="{{ 'active' if active_filter == 'notes' }}" href="{{ url_for('index', filter='notes') }}">Notes</a>
-  {% if nav_categories %}<div class="side-nav-title">Custom</div>{% endif %}
-  {% for cat in nav_categories %}
-    <a class="{{ 'active' if active_filter == 'cat:' ~ cat.name }}" href="{{ url_for('index', filter='cat:' ~ cat.name) }}">
-      {{ cat.icon or '📁' }} {{ cat.name }}
-    </a>
-  {% endfor %}
-</aside>
-<section class="dashboard-content">
 <h1>Dashboard</h1>
 {{ flash | safe }}
 
@@ -924,7 +1328,6 @@ _INDEX = _BASE + """
   <div class="card-body">
     <div class="card-title"><a href="{{ url_for('view', rel=rrel(task.path), type='task') }}">{{ task.title }}</a></div>
     <div class="card-meta">
-      {% if task.sync_mode == 'PRIVATE' %}<span class="tag tag-pri">🔒 private</span>{% endif %}
       {% if task.remind_at %}<span class="remind">⏰ {{ task.remind_at | disp }}</span>{% endif %}
       {% if task.edited_by %}<span>{{ task.edited_by }}</span>{% endif %}
     </div>
@@ -939,7 +1342,8 @@ _INDEX = _BASE + """
   </div>
 </div>
 {% endfor %}
-{% if not utasks %}<p class="empty">No tasks yet.</p>{% endif %}
+{% for p in data.private_tasks %}{{ private_card(p) }}{% endfor %}
+{% if not utasks and not data.private_tasks %}<p class="empty">No tasks yet.</p>{% endif %}
 {% endif %}
 
 {# ── My Notes ── #}
@@ -953,7 +1357,6 @@ _INDEX = _BASE + """
   <div class="card-body">
     <div class="card-title"><a href="{{ url_for('view', rel=rrel(note.path), type='note') }}">{{ note.title }}</a></div>
     <div class="card-meta">
-      {% if note.sync_mode == 'PRIVATE' %}<span class="tag tag-pri">🔒 private</span>{% endif %}
       {% if note.remind_at %}<span class="remind">⏰ {{ note.remind_at | disp }}</span>{% endif %}
       {% if note.edited_by %}<span>{{ note.edited_by }}</span>{% endif %}
     </div>
@@ -963,7 +1366,8 @@ _INDEX = _BASE + """
   </div>
 </div>
 {% endfor %}
-{% if not unotes %}<p class="empty">No notes yet.</p>{% endif %}
+{% for p in data.private_notes %}{{ private_card(p) }}{% endfor %}
+{% if not unotes and not data.private_notes %}<p class="empty">No notes yet.</p>{% endif %}
 {% endif %}
 
 {# ── Categories ── #}
@@ -994,11 +1398,147 @@ _INDEX = _BASE + """
 {% if category_filter == cat_name and not active %}<p class="empty" style="margin-left:14px">No items in this type yet.</p>{% endif %}
 {% endif %}
 {% endfor %}
-</section>
-</main>"""
+""" + _END
+
+_CALENDAR = _BASE + """
+<div class="cal-head">
+  <h1>{{ month_label }}</h1>
+  <a class="btn btn-sm" href="{{ url_for('calendar', month=prev_month) }}" aria-label="Previous month">◀</a>
+  <a class="btn btn-sm" href="{{ url_for('calendar') }}">Today</a>
+  <a class="btn btn-sm" href="{{ url_for('calendar', month=next_month) }}" aria-label="Next month">▶</a>
+  <a class="btn btn-sm btn-primary" href="{{ url_for('new_calendar', date=selected.isoformat()) }}">+ Calendar item</a>
+</div>
+{{ flash | safe }}
+<table class="cal">
+  <thead><tr><th class="wk">Wk</th>{% for wd in weekday_names %}<th>{{ wd }}</th>{% endfor %}</tr></thead>
+  <tbody>
+  {% for week in weeks %}
+  <tr>
+    <td class="wk">{{ week[0].isocalendar()[1] }}</td>
+    {% for d in week %}
+    {% set items = days.get(d, []) %}
+    <td class="{{ 'out' if d.month != month_num }} {{ 'today' if d == today }} {{ 'sel' if d == selected }}">
+      <a class="daynum" href="{{ url_for('calendar', month=d.strftime('%Y-%m'), day=d.isoformat()) }}">{{ d.day }}</a>
+      {% for e in items[:3] %}
+        {% if e.rel %}
+        <a class="chip chip-{{ e.kind }}" href="{{ url_for('view', rel=rrel(e.rel), type=e.kind) }}" title="{{ e.title }}">{{ e.icon or '' }} {% if e.time %}{{ e.time }} {% endif %}{{ e.title }}</a>
+        {% else %}
+        <span class="chip chip-{{ e.kind }}" title="{{ e.title }} (repeated)">{{ e.icon or '↻' }} {{ e.title }}</span>
+        {% endif %}
+      {% endfor %}
+      {% if items | length > 3 %}
+      <a class="chip chip-more" href="{{ url_for('calendar', month=d.strftime('%Y-%m'), day=d.isoformat()) }}">+{{ items | length - 3 }} more</a>
+      {% endif %}
+    </td>
+    {% endfor %}
+  </tr>
+  {% endfor %}
+  </tbody>
+</table>
+
+<div class="section">
+  <h2>{{ selected.strftime('%A %d %B %Y') }}</h2>
+  <a class="btn btn-sm" href="{{ url_for('new_calendar', date=selected.isoformat()) }}">+ Add on this date</a>
+</div>
+{% for e in days.get(selected, []) %}
+<div class="card">
+  <span class="kind" title="{{ e.kind }}">{{ e.icon or {'calendar': '📅', 'task': '☑', 'note': '✎', 'repeated': '↻'}[e.kind] }}</span>
+  <div class="card-body">
+    <div class="card-title">
+      {% if e.rel %}<a href="{{ url_for('view', rel=rrel(e.rel), type=e.kind) }}">{{ e.title }}</a>{% else %}{{ e.title }}{% endif %}
+    </div>
+    <div class="card-meta">
+      <span>{{ {'calendar': 'Calendar', 'task': 'Task', 'note': 'Note', 'repeated': 'Repeated event'}[e.kind] }}</span>
+      {% if e.time %}<span class="remind">⏰ {{ e.time }}</span>{% elif e.kind == 'calendar' %}<span>all day</span>{% endif %}
+      {% if e.end and e.end != e.start %}<span>{{ e.start.strftime('%d %b') }} – {{ e.end.strftime('%d %b') }}</span>{% endif %}
+      {% if e.repeat_days %}<span>↻ every {{ e.repeat_days }} day{{ 's' if e.repeat_days != 1 }}{% if e.until %} until {{ e.until.strftime('%d %b %Y') }}{% endif %}</span>{% endif %}
+      {% if e.repeat_by_date %}<span>↻ yearly</span>{% endif %}
+      {% if e.sync_mode == 'SHARED' %}<span class="tag tag-shr">shared</span>{% endif %}
+      {% if e.assigned_to %}<span>👤 {{ e.assigned_to }}</span>{% endif %}
+    </div>
+  </div>
+  {% if e.rel %}
+  <div class="card-actions">
+    <a class="btn btn-sm" href="{{ url_for('edit', rel=rrel(e.rel), type=e.kind) }}">Edit</a>
+  </div>
+  {% endif %}
+</div>
+{% else %}
+<p class="empty">Nothing on this date.</p>
+{% endfor %}
+
+{% if private_calendar %}
+<div class="section"><h2>🔒 Private calendar items</h2></div>
+<p class="empty">Their dates are encrypted, so they can't be placed on the calendar here.</p>
+{% for p in private_calendar %}{{ private_card(p) }}{% endfor %}
+{% endif %}
+""" + _END
+
+_CAL_EDIT = _BASE + """
+<h1>{{ 'Edit' if is_edit else 'New' }} Calendar Item</h1>
+{{ flash | safe }}
+<form method="post">
+  <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+  {% if is_edit %}<input type="hidden" name="rel" value="{{ rel }}">{% endif %}
+  <div class="fr"><label>Title</label>
+    <input type="text" name="title" value="{{ f.title }}" required autofocus>
+  </div>
+  <div class="row2">
+    <div class="fr"><label>Date</label>
+      <input type="date" name="date" value="{{ f.date }}" required>
+    </div>
+    <div class="fr"><label>Time — leave empty for an all-day item (a time also sets an alarm)</label>
+      <input type="time" name="time" value="{{ f.time }}">
+    </div>
+  </div>
+  <div class="row2">
+    <div class="fr"><label>End date, or repeat-until date when repeating (optional)</label>
+      <input type="date" name="end_date" value="{{ f.end_date }}">
+    </div>
+    <div class="fr"><label>End time (timed, non-repeating items only)</label>
+      <input type="time" name="end_time" value="{{ f.end_time }}">
+    </div>
+  </div>
+  <div class="row2">
+    <div class="fr"><label>Repeat every N days (optional)</label>
+      <input type="number" name="repeat" min="1" step="1" value="{{ f.repeat }}" placeholder="e.g. 7">
+    </div>
+    <div class="fr"><label>Calendar icon (emoji, optional)</label>
+      <input type="text" name="icon" value="{{ f.icon }}" maxlength="16" placeholder="e.g. 🎂">
+    </div>
+  </div>
+  <div class="fr"><label>Description (Markdown)</label>
+    <textarea name="body" style="min-height:160px">{{ f.body }}</textarea>
+  </div>
+  <div class="row2">
+    <div class="fr"><label>Sync mode</label>
+      <select name="sync_mode">
+        <option value="NORMAL"  {{ 'selected' if f.sync_mode == 'NORMAL' }}>Normal (personal)</option>
+        <option value="SHARED"  {{ 'selected' if f.sync_mode == 'SHARED' }}>Shared</option>
+      </select>
+    </div>
+    <div class="fr"><label>Assigned to (shared items; defaults to you)</label>
+      <input type="text" name="assigned_to" value="{{ f.assigned_to }}" placeholder="{{ current_user }}">
+    </div>
+  </div>
+  <div style="display:flex;gap:8px;margin-top:16px;flex-wrap:wrap">
+    <button type="submit" class="btn btn-primary">💾 Save</button>
+    <a class="btn" href="{{ back_url }}">Cancel</a>
+  </div>
+</form>
+{% if is_edit %}
+<form method="post" action="{{ url_for('delete') }}" style="display:inline"
+      onsubmit="return confirm('Delete this calendar item?')">
+  <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+  <input type="hidden" name="rel" value="{{ rel }}">
+  <input type="hidden" name="type" value="calendar">
+  <button type="submit" class="btn btn-danger btn-sm" style="margin-top:10px">🗑 Delete</button>
+</form>
+<p class="empty" style="margin-top:14px">Attachments can be added from the item's view page.</p>
+{% endif %}
+""" + _END
 
 _VIEW = _BASE + """
-<main>
 {{ flash | safe }}
 <div class="item-view">
   <div style="display:flex;gap:8px;margin-bottom:14px">
@@ -1011,15 +1551,23 @@ _VIEW = _BASE + """
     </form>
     {% endif %}
     <a class="btn" href="{{ url_for('edit', rel=rel, type=type) }}">✏ Edit</a>
+    {% if type == 'calendar' %}
+    <a class="btn" href="{{ url_for('calendar', month=(item.remind_at | stamp)[:7], day=(item.remind_at | stamp)[:10]) }}">← Calendar</a>
+    {% else %}
     <a class="btn" href="{{ url_for('index') }}">← Back</a>
+    {% endif %}
   </div>
   <h1>{{ item.title }}</h1>
   <div class="item-meta">
     {% if item.done %}<span class="tag tag-done">✓ Done</span>{% endif %}
-    {% if item.sync_mode == 'PRIVATE' %}<span class="tag tag-pri">🔒 Private</span>{% endif %}
     {% if item.sync_mode == 'SHARED' %}<span class="tag tag-shr">🌐 Shared</span>{% endif %}
     {% if item.category %}<span class="tag" style="background:var(--sur2)">📁 {{ item.category }}</span>{% endif %}
-    {% if item.remind_at %}<span class="remind">⏰ {{ item.remind_at | disp }}</span>{% endif %}
+    {% if type == 'calendar' %}
+    {% if item.calendar_icon %}<span>{{ item.calendar_icon }}</span>{% endif %}
+    <span class="remind">📅 {{ item.remind_at | caldisp(item.all_day) }}{% if item.end_at and not item.repeat_days %} – {{ item.end_at | caldisp(item.all_day) }}{% endif %}</span>
+    {% if item.repeat_days %}<span>↻ every {{ item.repeat_days }} day{{ 's' if item.repeat_days != 1 }}{% if item.end_at %} until {{ item.end_at | caldisp(True) }}{% endif %}</span>{% endif %}
+    {% if item.assigned_to %}<span>👤 {{ item.assigned_to }}</span>{% endif %}
+    {% elif item.remind_at %}<span class="remind">⏰ {{ item.remind_at | disp }}</span>{% endif %}
     {% if item.edited_by %}<span>by {{ item.edited_by }}</span>{% endif %}
     {% if item.edited_at %}<span>{{ item.edited_at | eddate }}</span>{% endif %}
   </div>
@@ -1103,10 +1651,9 @@ _VIEW = _BASE + """
 })();
 </script>
 {% endif %}
-</main>"""
+""" + _END
 
 _EDIT = _BASE + """
-<main>
 <h1>{{ 'Edit' if is_edit else 'New' }} {{ 'Task' if type == 'task' else 'Note' }}</h1>
 {{ flash | safe }}
 <form method="post">
@@ -1132,7 +1679,6 @@ _EDIT = _BASE + """
     <select name="sync_mode">
       <option value="NORMAL"   {{ 'selected' if item.sync_mode == 'NORMAL' }}>Normal (personal)</option>
       <option value="SHARED"   {{ 'selected' if item.sync_mode == 'SHARED' }}>Shared</option>
-      <option value="PRIVATE"  {{ 'selected' if item.sync_mode == 'PRIVATE' }}>Private (encrypted)</option>
       <option value="DISABLED" {{ 'selected' if item.sync_mode == 'DISABLED' }}>Disabled (local only)</option>
     </select>
   </div>
@@ -1203,10 +1749,9 @@ _EDIT = _BASE + """
   </form>
 </div>
 {% endif %}
-</main>"""
+""" + _END
 
 _HISTORY = _BASE + """
-<main>
 <h1>History</h1>
 {{ flash | safe }}
 <p style="font-size:13px;color:var(--mut);margin-bottom:16px">
@@ -1221,7 +1766,9 @@ _HISTORY = _BASE + """
   {% set _ = del_cat_notes.extend(cnotes | rejectattr('deleted_at', 'none') | list) %}
 {% endfor %}
 
-{% if not del_tasks and not del_notes and not del_cat_notes %}
+{% set del_cal = (data.user_calendar + data.shared_calendar) | rejectattr('deleted_at', 'none') | list %}
+
+{% if not del_tasks and not del_notes and not del_cat_notes and not del_cal %}
 <p class="empty" style="margin-top:24px">No deleted items.</p>
 {% endif %}
 
@@ -1272,15 +1819,38 @@ _HISTORY = _BASE + """
 </div>
 {% endfor %}
 {% endif %}
-</main>"""
+
+{% if del_cal %}
+<div class="section"><h2>📅 Calendar</h2></div>
+{% for item in del_cal %}
+<div class="card deleted">
+  <div class="card-body">
+    <div class="card-title">{{ item.title }}</div>
+    <div class="card-meta">
+      {% if item.remind_at %}<span>{{ item.remind_at | caldisp(item.all_day) }}</span>{% endif %}
+      {% if item.deleted_at %}<span>deleted {{ item.deleted_at | eddate }}</span>{% endif %}
+      {% if item.edited_by %}<span>by {{ item.edited_by }}</span>{% endif %}
+    </div>
+  </div>
+  <div class="card-actions">
+    <form class="il" method="post" action="{{ url_for('restore') }}"
+          onsubmit="return confirm('Restore? It will sync to all devices as a new item.')">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+      <input type="hidden" name="rel" value="{{ rrel(item.path) }}">
+      <button class="btn btn-sm btn-primary">↩ Restore</button>
+    </form>
+  </div>
+</div>
+{% endfor %}
+{% endif %}
+""" + _END
 
 
 _SEARCH = _BASE + """
-<main>
 <h1>Search</h1>
 {{ flash | safe }}
 <form method="get" action="{{ url_for('search') }}" style="display:flex;gap:8px;margin-bottom:20px">
-  <input type="text" name="q" value="{{ q | e }}" placeholder="Search tasks and notes…"
+  <input type="text" name="q" value="{{ q | e }}" placeholder="Search tasks, notes and calendar…"
          autofocus style="flex:1;max-width:480px">
   <button type="submit" class="btn btn-primary">Search</button>
   {% if q %}<a class="btn" href="{{ url_for('search') }}">✕</a>{% endif %}
@@ -1294,7 +1864,7 @@ _SEARCH = _BASE + """
 <div class="card">
   <div class="card-body">
     <div class="card-title">
-      <span style="font-size:12px;color:var(--mut);margin-right:6px">{{ '☑' if r.is_task else '✎' }}</span>
+      <span style="font-size:12px;color:var(--mut);margin-right:6px">{{ {'task': '☑', 'calendar': '📅'}.get(r.type, '✎') }}</span>
       <a href="{{ url_for('view', rel=r.rel, type=r.type, highlight=q) }}">{{ r.title }}</a>
     </div>
     {% if r.snippet %}
@@ -1303,7 +1873,7 @@ _SEARCH = _BASE + """
   </div>
 </div>
 {% endfor %}
-</main>"""
+""" + _END
 
 
 # ── URL helpers ─────────────────────────────────────────────────────────────
@@ -1325,6 +1895,7 @@ def _flash_redirect(next_url: Optional[str], fallback: str,
 # ── Flask app factory ───────────────────────────────────────────────────────
 
 def create_app(root: Path) -> Flask:
+    from markupsafe import escape
     from werkzeug.middleware.proxy_fix import ProxyFix
     app = Flask(__name__)
     app.secret_key = secrets.token_hex(32)
@@ -1373,9 +1944,7 @@ def create_app(root: Path) -> Flask:
     }
 
     def get_store() -> FileStore:
-        username = session.get('username', '')
-        passphrase = load_web_users(root).get(username)
-        return FileStore(root, passphrase)
+        return FileStore(root)
 
     def require_login(f):
         @functools.wraps(f)
@@ -1393,10 +1962,7 @@ def create_app(root: Path) -> Flask:
 
     def rewrite_attach_urls(body: str, rel: str) -> str:
         """Rewrite relative attachment links (slug/filename) embedded in markdown to the /attachment route."""
-        stem = rel.rsplit('/', 1)[-1] if '/' in rel else rel
-        if stem.endswith('.md'):
-            stem = stem[:-3]
-        stem = stem.lstrip('.')
+        stem = item_stem(rel.rsplit('/', 1)[-1])
         if not stem:
             return body
         return re.sub(
@@ -1418,10 +1984,40 @@ def create_app(root: Path) -> Flask:
             return f'<div class="flash flash-err">{escape(err)}</div>'
         return ''
 
+    def nav_categories(username: str) -> list[CustomCategory]:
+        """Categories from .categories.meta plus any custom folder missing from it."""
+        user_dir = root / sanitize_user_folder(username)
+        cats = FileStore(root).load_categories(user_dir) if user_dir.is_dir() else []
+        known = {c.name for c in cats}
+        custom = user_dir / 'custom'
+        if custom.is_dir():
+            for d in sorted(custom.iterdir()):
+                if d.is_dir() and not d.name.startswith('.') and d.name not in known:
+                    cats.append(CustomCategory(name=d.name, icon='📁', color=None))
+        return cats
+
+    def nav_active() -> str:
+        """Which side-nav entry the current page belongs to."""
+        ep = request.endpoint
+        if ep == 'index':
+            return request.args.get('filter', 'all')
+        if ep in ('calendar', 'new_calendar', 'edit_calendar'):
+            return 'calendar'
+        if ep == 'history':
+            return 'history'
+        if ep == 'new_note':
+            cat = request.args.get('category', '')
+            return f'cat:{cat}' if cat else 'notes'
+        if ep == 'new_task':
+            return 'tasks'
+        if ep in ('view', 'edit'):
+            return {'task': 'tasks', 'note': 'notes', 'calendar': 'calendar'}.get(request.args.get('type', ''), '')
+        return ''
+
     def ctx() -> dict:
         username = session.get('username', '')
-        return dict(root_label=str(root), rrel=rrel,
-                    current_user=username, default_user=username)
+        return dict(rrel=rrel, current_user=username, default_user=username,
+                    nav_categories=nav_categories(username), nav_active=nav_active())
 
     # Template filters
     @app.template_filter('disp')
@@ -1429,6 +2025,12 @@ def create_app(root: Path) -> Flask:
 
     @app.template_filter('stamp')
     def f_stamp(v): return format_reminder_stamp(v) if v else ''
+
+    @app.template_filter('caldisp')
+    def f_caldisp(v, all_day=False):
+        if not v:
+            return ''
+        return datetime.fromtimestamp(v / 1000).strftime("%d %b %Y" if all_day else "%d %b %Y %H:%M")
 
     @app.template_filter('eddate')
     def f_eddate(v): return f"edited {format_edited_display(v)}" if v else ''
@@ -1479,13 +2081,7 @@ def create_app(root: Path) -> Flask:
         active_filter = request.args.get('filter', 'all')
         if active_filter not in {'all', 'tasks', 'notes'} and not active_filter.startswith('cat:'):
             active_filter = 'all'
-        nav_categories = list(data.get('categories', []))
-        known_category_names = {cat.name for cat in nav_categories}
-        for cat_name in data.get('category_notes', {}):
-            if cat_name not in known_category_names:
-                nav_categories.append(CustomCategory(name=cat_name, icon='📁', color=None))
-        return render_template_string(_INDEX, data=data, nav_categories=nav_categories,
-                                      active_filter=active_filter, flash=flash_msg(), **ctx())
+        return render_template_string(_INDEX, data=data, active_filter=active_filter, flash=flash_msg(), **ctx())
 
     @app.route('/view')
     @require_login
@@ -1498,11 +2094,10 @@ def create_app(root: Path) -> Flask:
         text = store.read_text(path)
         if text is None:
             abort(404)
-        item = parse_task(text) if itype == 'task' else parse_note(text)
+        item = parse_item(text, itype)
         if item is None:
             abort(404)
-        body = item.description if itype == 'task' else item.content
-        body = rewrite_attach_urls(body, rel)
+        body = rewrite_attach_urls(item_body(item, itype), rel)
         return render_template_string(_VIEW, item=item, type=itype,
                                       rel=rel, content_html=render_md(body),
                                       highlight=highlight,
@@ -1518,14 +2113,15 @@ def create_app(root: Path) -> Flask:
         if len(q) >= 2:
             data = store.load_for_user(session['username'])
             all_items = (
-                [(t, True) for t in data['shared_tasks'] + data.get('user_tasks', []) if not t.deleted_at]
-                + [(n, False) for n in data['shared_notes'] + data.get('user_notes', []) if not n.deleted_at]
-                + [(n, False) for notes in data.get('category_notes', {}).values()
+                [(t, 'task') for t in data['shared_tasks'] + data.get('user_tasks', []) if not t.deleted_at]
+                + [(n, 'note') for n in data['shared_notes'] + data.get('user_notes', []) if not n.deleted_at]
+                + [(n, 'note') for notes in data.get('category_notes', {}).values()
                    for n in notes if not n.deleted_at]
+                + [(c, 'calendar') for c in data['shared_calendar'] + data['user_calendar'] if not c.deleted_at]
             )
             ql = q.lower()
-            for item, is_task in all_items:
-                body = item.description if is_task else item.content
+            for item, itype in all_items:
+                body = item_body(item, itype)
                 in_title = ql in item.title.lower()
                 in_body = ql in body.lower()
                 if not in_title and not in_body:
@@ -1545,8 +2141,7 @@ def create_app(root: Path) -> Flask:
                 results.append({
                     'title': item.title,
                     'rel': store.rel(item.path) if item.path else '',
-                    'type': 'task' if is_task else 'note',
-                    'is_task': is_task,
+                    'type': itype,
                     'snippet': snippet,
                 })
         return render_template_string(_SEARCH, q=q, results=results,
@@ -1564,11 +2159,9 @@ def create_app(root: Path) -> Flask:
         if not rel or not name or '/' in name or '\\' in name or '..' in name:
             abort(400)
         md_path = store.safe_abs(rel)
-        stem = md_path.name
-        if stem.endswith('.md'):
-            stem = stem[:-3]
-        stem = stem.lstrip('.')
-        attach_path = (md_path.parent / stem / name).resolve()
+        if is_private_path(md_path):
+            abort(403)
+        attach_path = (md_path.parent / item_stem(md_path.name) / name).resolve()
         # Safety: must stay inside root
         if not str(attach_path).startswith(str(root.resolve())):
             abort(403)
@@ -1578,9 +2171,7 @@ def create_app(root: Path) -> Flask:
         return Response(attach_path.read_bytes(), mimetype=mime or 'application/octet-stream')
 
     def _attach_dir(md_path: Path) -> Path:
-        stem = md_path.name[:-3] if md_path.name.endswith('.md') else md_path.name
-        stem = stem.lstrip('.')
-        return md_path.parent / stem
+        return md_path.parent / item_stem(md_path.name)
 
     def _read_attach_meta(attach_dir: Path) -> dict:
         """Read .attachments.meta → {remote_name: updated_at} dict."""
@@ -1638,15 +2229,13 @@ def create_app(root: Path) -> Flask:
         mime = f.content_type or mimetypes.guess_type(filename)[0] or 'application/octet-stream'
         now_ms = int(time.time() * 1000)
         att = Attachment(id=secrets.token_hex(8), mime_type=mime, remote_name=filename, updated_at=now_ms)
-        item = parse_task(text) if itype == 'task' else parse_note(text)
+        item = parse_item(text, itype)
         if item is None:
             abort(404)
         # Replace any existing attachment with the same filename so timestamps stay consistent
         item.attachments = [a for a in item.attachments if a.remote_name != filename]
         item.attachments.append(att)
-        private = path.name.startswith('.')
-        md = task_to_markdown(item) if itype == 'task' else note_to_markdown(item)
-        store.write_text(path, md, private=private)
+        store.write_text(path, item_to_markdown(item, itype))
         store.write_sidecar(path, now_ms, session.get('username'))
         # Update .attachments.meta so other devices detect the new/replaced file
         meta = _read_attach_meta(attach_dir)
@@ -1668,7 +2257,7 @@ def create_app(root: Path) -> Flask:
         text = store.read_text(path)
         if text is None:
             abort(404)
-        item = parse_task(text) if itype == 'task' else parse_note(text)
+        item = parse_item(text, itype)
         if item is None:
             abort(404)
         att = next((a for a in item.attachments if a.id == att_id), None)
@@ -1683,9 +2272,7 @@ def create_app(root: Path) -> Flask:
         if attach_path.is_file():
             attach_path.unlink()
         item.attachments.remove(att)
-        private = path.name.startswith('.')
-        md = task_to_markdown(item) if itype == 'task' else note_to_markdown(item)
-        store.write_text(path, md, private=private)
+        store.write_text(path, item_to_markdown(item, itype))
         store.write_sidecar(path, int(time.time() * 1000), session.get('username'))
         # Remove the entry from .attachments.meta so other devices delete the file on next sync
         meta = _read_attach_meta(attach_dir)
@@ -1714,7 +2301,7 @@ def create_app(root: Path) -> Flask:
                 title=title,
                 description=request.form.get('body', '').strip(),
                 done='done' in request.form,
-                sync_mode=request.form.get('sync_mode', 'NORMAL'),
+                sync_mode=web_sync_mode(request.form.get('sync_mode')),
                 remind_at=parse_reminder_stamp(request.form.get('remind_at', '')),
                 edited_by=request.form.get('edited_by', '').strip() or None,
             )
@@ -1743,7 +2330,7 @@ def create_app(root: Path) -> Flask:
             note = Note(
                 title=title,
                 content=request.form.get('body', '').strip(),
-                sync_mode=request.form.get('sync_mode', 'NORMAL'),
+                sync_mode=web_sync_mode(request.form.get('sync_mode')),
                 remind_at=parse_reminder_stamp(request.form.get('remind_at', '')),
                 edited_by=request.form.get('edited_by', '').strip() or None,
                 category=request.form.get('category', '').strip() or None,
@@ -1767,6 +2354,8 @@ def create_app(root: Path) -> Flask:
         username = session['username']
         rel = request.args.get('rel') or request.form.get('rel', '')
         itype = request.args.get('type') or request.form.get('type', 'note')
+        if itype == 'calendar':
+            return redirect(url_for('edit_calendar', **request.args))
         path = store.safe_abs(rel)
         text = store.read_text(path)
         if text is None:
@@ -1777,11 +2366,10 @@ def create_app(root: Path) -> Flask:
             title = request.form.get('title', '').strip()
             if not title:
                 return redirect(url_for('edit', rel=rel, type=itype, err='Title is required'))
-            sync_mode = request.form.get('sync_mode', 'NORMAL')
+            sync_mode = web_sync_mode(request.form.get('sync_mode'))
             remind_at = parse_reminder_stamp(request.form.get('remind_at', ''))
             edited_by = request.form.get('edited_by', '').strip() or None
             now_ms = int(time.time() * 1000)
-            private = sync_mode == 'PRIVATE'
             sc = store.read_sidecar(path)
             old_deleted_at = sc.get('deleted_at')
             if itype == 'task':
@@ -1794,12 +2382,16 @@ def create_app(root: Path) -> Flask:
                     done='done' in request.form,
                     sync_mode=sync_mode,
                     remind_at=remind_at,
+                    end_at=old.end_at if old else None,
+                    assigned_to=old.assigned_to if old else None,
+                    calendar_icon=old.calendar_icon if old else None,
+                    hide_until_reminder=old.hide_until_reminder if old else False,
                     edited_at=now_ms,
                     deleted_at=old_deleted_at,
                     attachments=old.attachments if old else [],
                     edited_by=edited_by,
                 )
-                store.write_text(path, task_to_markdown(task), private=private)
+                store.write_text(path, task_to_markdown(task))
                 store.write_sidecar(path, now_ms, edited_by, old_deleted_at)
             else:
                 old = parse_note(text)
@@ -1811,13 +2403,17 @@ def create_app(root: Path) -> Flask:
                     content=request.form.get('body', '').strip(),
                     sync_mode=sync_mode,
                     remind_at=remind_at,
+                    end_at=old.end_at if old else None,
+                    assigned_to=old.assigned_to if old else None,
+                    calendar_icon=old.calendar_icon if old else None,
+                    hide_until_reminder=old.hide_until_reminder if old else False,
                     edited_at=now_ms,
                     deleted_at=old_deleted_at,
                     attachments=old.attachments if old else [],
                     category=cat,
                     edited_by=edited_by,
                 )
-                store.write_text(path, note_to_markdown(note), private=private)
+                store.write_text(path, note_to_markdown(note))
                 store.write_sidecar(path, now_ms, edited_by, old_deleted_at)
             return redirect(url_for('index', ok=f'{title} saved'))
 
@@ -1827,6 +2423,202 @@ def create_app(root: Path) -> Flask:
         return render_template_string(_EDIT, item=item, type=itype, is_edit=True,
                                       rel=rel, user=username, categories=cats,
                                       flash=flash_msg(), **ctx())
+
+    # ── Calendar ───────────────────────────────────────────────────────────
+
+    def _parse_date(v: str) -> Optional[date]:
+        try:
+            return datetime.strptime(v.strip(), '%Y-%m-%d').date()
+        except ValueError:
+            return None
+
+    def _parse_time(v: str) -> Optional[tuple]:
+        try:
+            t = datetime.strptime(v.strip(), '%H:%M')
+        except ValueError:
+            return None
+        return t.hour, t.minute
+
+    def _local_ms(d: date, hm: Optional[tuple]) -> int:
+        """Timed instant, or local noon for date-only stamps (as the app does)."""
+        hour, minute = hm if hm else (12, 0)
+        return int(datetime(d.year, d.month, d.day, hour, minute).timestamp() * 1000)
+
+    def _calendar_form_values(item: Optional[CalendarItem], default_date: str = '') -> dict:
+        if item is None:
+            return dict(title='', body='', date=default_date, time='', end_date='', end_time='',
+                        repeat='', icon='', sync_mode='NORMAL', assigned_to='')
+        start = datetime.fromtimestamp(item.remind_at / 1000) if item.remind_at else None
+        end = datetime.fromtimestamp(item.end_at / 1000) if item.end_at else None
+        return dict(
+            title=item.title, body=item.description,
+            date=start.strftime('%Y-%m-%d') if start else '',
+            time=start.strftime('%H:%M') if start and not item.all_day else '',
+            end_date=end.strftime('%Y-%m-%d') if end else '',
+            end_time=end.strftime('%H:%M') if end and not item.all_day and not item.repeat_days else '',
+            repeat=str(item.repeat_days) if item.repeat_days else '',
+            icon=item.calendar_icon or '', sync_mode=item.sync_mode,
+            assigned_to=item.assigned_to or '',
+        )
+
+    def _calendar_from_form(form, old: Optional[CalendarItem], username: str):
+        """Build a CalendarItem from the form with the app's save rules. Returns (item, error)."""
+        title = form.get('title', '').strip()
+        if not title:
+            return None, 'Set a heading before saving.'
+        start_day = _parse_date(form.get('date', ''))
+        if start_day is None:
+            return None, 'Set a date before saving this calendar item.'
+        time_text = form.get('time', '').strip()
+        start_hm = _parse_time(time_text) if time_text else None
+        if time_text and start_hm is None:
+            return None, 'Calendar time is invalid.'
+        repeat_text = form.get('repeat', '').strip()
+        repeat_days = None
+        if repeat_text:
+            if not repeat_text.isdigit() or int(repeat_text) <= 0:
+                return None, 'Repeat interval must be a positive number of days.'
+            repeat_days = int(repeat_text)
+        all_day = start_hm is None
+        end_text = form.get('end_date', '').strip()
+        end_at = None
+        if end_text:
+            end_day = _parse_date(end_text)
+            if end_day is None:
+                return None, 'End date is invalid.'
+            if end_day < start_day:
+                return None, ('Repeat end date must be on or after the first occurrence.' if repeat_days
+                              else 'End date must be on or after the start date.')
+            end_hm = None
+            if not all_day and not repeat_days:
+                end_time_text = form.get('end_time', '').strip()
+                end_hm = _parse_time(end_time_text) if end_time_text else start_hm
+                if end_hm is None:
+                    return None, 'End time is invalid.'
+            end_at = _local_ms(end_day, end_hm)
+        sync_mode = 'SHARED' if form.get('sync_mode') == 'SHARED' else 'NORMAL'
+        remind_at = _local_ms(start_day, start_hm)
+        now_ms = int(time.time() * 1000)
+        assigned = form.get('assigned_to', '').strip() or username
+        icon = form.get('icon', '').strip() or None
+        item = CalendarItem(
+            title=title,
+            description=form.get('body', '').strip(),
+            sync_mode=sync_mode,
+            remind_at=remind_at,
+            end_at=end_at,
+            all_day=all_day,
+            repeat_days=repeat_days,
+            assigned_to=assigned if sync_mode == 'SHARED' else None,
+            calendar_icon=icon,
+            hide_until_reminder=bool(old and old.hide_until_reminder and remind_at > now_ms),
+            edited_at=now_ms,
+            category=old.category if old else None,
+            edited_by=username,
+            attachments=old.attachments if old else [],
+        )
+        return item, None
+
+    def _calendar_path_taken(store: FileStore, item: CalendarItem, username: str,
+                             own: Optional[Path] = None) -> bool:
+        """True if another item already uses this title's file, including a device's private
+        .<slug>.enc copy (both would share one sidecar)."""
+        path = store.calendar_path(item, username)
+        private_copy = path.parent / f'.{item_stem(path.name)}.enc'
+        return any(p.is_file() and p != own for p in (path, private_copy))
+
+    def _month_url_for(ms: int, **params) -> str:
+        d = _local_date(ms)
+        return url_for('calendar', month=d.strftime('%Y-%m'), day=d.isoformat(), **params)
+
+    @app.route('/calendar')
+    @require_login
+    def calendar():
+        store = get_store()
+        today = date.today()
+        selected = _parse_date(request.args.get('day', '')) or None
+        try:
+            first = datetime.strptime(request.args.get('month', ''), '%Y-%m').date()
+        except ValueError:
+            first = (selected or today).replace(day=1)
+        if selected is None or (selected.year, selected.month) != (first.year, first.month):
+            selected = today if (today.year, today.month) == (first.year, first.month) else first
+        grid_start = first - timedelta(days=first.weekday())  # Monday-first, as the app defaults
+        grid = [grid_start + timedelta(days=i) for i in range(42)]
+        weeks = [grid[i:i + 7] for i in range(0, 42, 7)]
+        data = store.load_for_user(session['username'])
+        days = calendar_by_day(calendar_entries(data), grid[0], grid[-1])
+        prev_month = (first - timedelta(days=1)).strftime('%Y-%m')
+        next_month = (first + timedelta(days=32)).replace(day=1).strftime('%Y-%m')
+        return render_template_string(
+            _CALENDAR, weeks=weeks, days=days, today=today, selected=selected,
+            private_calendar=data['private_calendar'],
+            month_num=first.month, month_label=first.strftime('%B %Y'),
+            prev_month=prev_month, next_month=next_month,
+            weekday_names=['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'],
+            flash=flash_msg(), **ctx())
+
+    @app.route('/new/calendar', methods=['GET', 'POST'])
+    @require_login
+    @csrf_protect
+    def new_calendar():
+        store = get_store()
+        username = session['username']
+        default_date = request.args.get('date', '') or date.today().isoformat()
+        if request.method == 'POST':
+            item, err = _calendar_from_form(request.form, None, username)
+            if item and _calendar_path_taken(store, item, username):
+                err = f'A calendar item named "{item.title}" already exists.'
+            if err:
+                values = _calendar_form_values(None)
+                values.update({k: request.form.get(k, '') for k in values})
+                return render_template_string(
+                    _CAL_EDIT, f=values, is_edit=False, rel=None,
+                    back_url=url_for('calendar'),
+                    flash=f'<div class="flash flash-err">{escape(err)}</div>', **ctx())
+            try:
+                store.write_calendar(item, store.calendar_path(item, username))
+            except Exception as e:
+                return redirect(url_for('new_calendar', date=request.form.get('date', ''), err=str(e)))
+            return redirect(_month_url_for(item.remind_at, ok=f'Calendar item "{item.title}" created'))
+        return render_template_string(
+            _CAL_EDIT, f=_calendar_form_values(None, default_date), is_edit=False, rel=None,
+            back_url=url_for('calendar'), flash=flash_msg(), **ctx())
+
+    @app.route('/calendar/edit', methods=['GET', 'POST'])
+    @require_login
+    @csrf_protect
+    def edit_calendar():
+        store = get_store()
+        username = session['username']
+        rel = request.args.get('rel') or request.form.get('rel', '')
+        path = store.safe_abs(rel)
+        text = store.read_text(path) if path.is_file() else None
+        old = parse_calendar_item(text) if text else None
+        if old is None:
+            abort(404)
+        back_url = url_for('view', rel=rel, type='calendar')
+        if request.method == 'POST':
+            item, err = _calendar_from_form(request.form, old, username)
+            new_path = store.calendar_path(item, username) if item else None
+            if item and new_path != path and _calendar_path_taken(store, item, username, own=path):
+                err = f'A calendar item named "{item.title}" already exists.'
+            if err:
+                values = _calendar_form_values(old)
+                values.update({k: request.form.get(k, '') for k in values})
+                return render_template_string(
+                    _CAL_EDIT, f=values, is_edit=True, rel=rel, back_url=back_url,
+                    flash=f'<div class="flash flash-err">{escape(err)}</div>', **ctx())
+            if new_path != path:
+                # Title or sync mode moved the file: hide the old copy first (as the app does
+                # for a changed remote path), then write the new one and carry attachments over.
+                store.mark_deleted(path)
+                store.move_attachments(path, new_path)
+            store.write_calendar(item, new_path)
+            return redirect(_month_url_for(item.remind_at, ok=f'{item.title} saved'))
+        return render_template_string(
+            _CAL_EDIT, f=_calendar_form_values(old), is_edit=True, rel=rel,
+            back_url=back_url, flash=flash_msg(), **ctx())
 
     @app.route('/toggle', methods=['POST'])
     @require_login
@@ -1843,7 +2635,7 @@ def create_app(root: Path) -> Flask:
             abort(400)
         task.done = not task.done
         task.edited_at = int(time.time() * 1000)
-        store.write_text(path, task_to_markdown(task), private=path.name.startswith('.'))
+        store.write_text(path, task_to_markdown(task))
         next_url = request.form.get('next') or url_for('index')
         return redirect(next_url)
 
@@ -1854,7 +2646,13 @@ def create_app(root: Path) -> Flask:
         store = get_store()
         rel = request.form.get('rel', '')
         path = store.safe_abs(rel)
+        if not path.is_file():
+            abort(404)
+        if is_private_path(path):
+            abort(403)  # private items are managed only by the device that created them
         store.mark_deleted(path)
+        if request.form.get('type') == 'calendar':
+            return redirect(url_for('calendar', ok='Calendar item deleted (restorable from History)'))
         return redirect(url_for('history', ok='Item moved to history'))
 
     @app.route('/history')
@@ -1924,14 +2722,12 @@ def main():
     if not root.is_dir():
         raise SystemExit(f"Root directory not found: {root}")
 
-    if not CRYPTO_AVAILABLE:
-        print("WARNING: 'cryptography' not installed — private files unreadable. pip install cryptography")
 
     users = load_web_users(root)
     if not users:
         print(f"NOTE: No web users configured.")
         print(f"  Create {root / _USERS_META} with lines:")
-        print(f"  webuser|<username>|<base64_of_passphrase>")
+        print(f"  webuser|<username>|<base64_of_password>")
         print(f"  (No logins will be accepted until users are configured.)")
     else:
         print(f"Web users: {', '.join(users)}")

@@ -11,9 +11,10 @@ It reads and writes the same Markdown files used by the app, letting you view, c
 SSH Memo stores all data as plain Markdown files on an SSH server you own. This web server runs alongside those files and provides a browser interface to them. It is entirely optional — the Android app works without it.
 
 - View and edit tasks and notes in a browser
+- Month calendar view with tasks, notes and calendar items; create, edit and delete calendar items
 - Renders Markdown, including checklists
 - Supports all item types: todos, notes, and custom categories
-- Decrypts and displays private (encrypted) items if you provide your passphrase
+- Lists private (encrypted) items by name only — they are opened on the device that created them
 - No database, no cloud, no accounts — just files
 - Runs as a systemd service
 
@@ -40,7 +41,7 @@ bash install.sh
 The installer will ask for the path to your SSHMemo sync folder (the directory the app writes its Markdown files into), then:
 
 1. Create a Python virtualenv in the repository directory
-2. Install dependencies (`flask`, `cryptography`, `markdown`)
+2. Install dependencies (`flask`, `markdown`, `nh3`)
 3. Register and start a `sshmemo` systemd service running as the current user, pointed at the data directory you specified
 
 Re-running `install.sh` is safe — it updates an existing installation.
@@ -56,8 +57,6 @@ sudo journalctl -u sshmemo -f
 ## Configuration
 
 The server is configured through the SSH Memo Android app. In Settings, set the web server password for your user. This writes a `.sshmemo_web.meta` file in the root of your data directory, which the server reads at startup.
-
-The password doubles as the passphrase for decrypting private/encrypted notes.
 
 If no `.sshmemo_web.meta` is present or no users are configured in it, the server will not accept any logins.
 
@@ -94,7 +93,7 @@ Attachment: <id>|<mimeType>|<filename>
 Body text in Markdown.
 ```
 
-Private items are AES-256-GCM encrypted with a key derived from your passphrase (PBKDF2-SHA256, 100 000 iterations). The server decrypts them in memory for display only — the files on disk remain encrypted.
+Private items are encrypted by the device that created them and stored as `.<name>.enc`. The server never decrypts them: it shows only the item's name, with a note to open it on that device. Items created or edited on the server are never private.
 
 ---
 
@@ -107,12 +106,15 @@ The server expects the SSH Memo data directory structure:
   <username>/
     todo/          ← task files (*.md)
     note/          ← note files (*.md)
-    shared/
-      todo/
-      note/
+    calendar/      ← calendar items (*.md, private items as .*.enc)
+    repeated_todo/ ← repeated items (repeated calendar events shown read-only)
     custom/
       <category>/  ← custom category note files
         .meta      ← category name, icon, color
+  shared/
+    todo/
+    note/
+    calendar/
   .sshmemo_web.meta  ← user credentials (written by app)
 ```
 
@@ -124,7 +126,7 @@ This server is designed for **personal, self-hosted use** — typically on a hom
 
 Known limitations to be aware of:
 
-- **Authentication is simple by design.** The login password is the same passphrase used to encrypt your private notes, so it must be stored in a recoverable form. Keep the data directory permissions tight and do not share the host with untrusted users.
+- **Authentication is simple by design.** The login password is stored base64-encoded (not hashed) in `.sshmemo_web.meta`. Keep the data directory permissions tight and do not share the host with untrusted users.
 - **No built-in HTTPS.** All traffic, including the login, is unencrypted unless you place the server behind a reverse proxy (nginx, Caddy) that handles TLS. Do not expose the server over the internet without this.
 - **No brute-force protection.** There is no rate limiting on login attempts. If the server is reachable from the internet, a reverse proxy or firewall rule to restrict access is strongly recommended.
 - **Sessions reset on restart.** Active login sessions are invalidated whenever the server process restarts.
@@ -138,7 +140,7 @@ For typical home-server or LAN use these limitations are acceptable. For anythin
 | Package | Purpose |
 |---------|---------|
 | `flask` | HTTP server and routing |
-| `cryptography` | AES-GCM decryption of private files |
+| `nh3` | Sanitising rendered Markdown HTML |
 | `markdown` | Rendering Markdown to HTML |
 
 ---
